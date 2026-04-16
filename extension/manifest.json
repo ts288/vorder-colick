@@ -15,7 +15,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.gov.kr/*", "https://*.gov.kr/*"],
-      "js": ["content/pip-panel.js"],
+      "js": ["content/pip-panel.js", "content/collector.js"],
       "css": ["styles/pip-panel.css"],
       "run_at": "document_idle"
     }
