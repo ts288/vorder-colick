@@ -155,18 +155,19 @@ function createPanel(savedState, styleText) {
 
   sendBtn.addEventListener("click", () => {
     const text = input.value.trim();
-    if (!text) {
-      return;
-    }
+    if (!text) return;
 
     if (!chrome.runtime?.id) {
       appendLog("[오류] 익스텐션이 재로드됐습니다. 페이지를 새로고침해주세요.");
       return;
     }
+
     appendLog(`[요청] ${text}`);
-    chrome.runtime.sendMessage({ type: "USER_REQUEST", payload: text });
+    statusEl.textContent = "⟳ 처리 중...";
+    sendBtn.disabled = true;
     input.value = "";
     saveInputValue("");
+    chrome.runtime.sendMessage({ type: "USER_REQUEST", payload: text });
   });
 
   input.addEventListener("input", () => {
@@ -183,9 +184,14 @@ function createPanel(savedState, styleText) {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === "UPDATE_STATUS") {
       statusEl.textContent = msg.payload;
+      // 상태가 비거나 완료/오류면 버튼 활성화
+      if (!msg.payload || msg.payload.startsWith("✓") || msg.payload.startsWith("[오류]")) {
+        sendBtn.disabled = false;
+      }
     }
     if (msg.type === "APPEND_LOG") {
       appendLog(msg.payload);
+      sendBtn.disabled = false;
     }
   });
 

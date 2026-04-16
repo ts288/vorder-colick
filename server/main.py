@@ -20,11 +20,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.state.sessions: dict[str, ProcessState] = {}
+app.state.process_state: ProcessState | None = None
 
 app.include_router(plan_router)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "sessions": len(app.state.sessions)}
+    return {
+        "status": "ok",
+        "phase": app.state.process_state.current_phase if app.state.process_state else "idle",
+    }

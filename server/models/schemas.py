@@ -1,28 +1,36 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 
-class ScreenAlert(BaseModel):
+class _Base(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+
+class ScreenAlert(_Base):
     type: str
     text: str
 
 
-class ScreenMeta(BaseModel):
+class ScreenMeta(_Base):
     current_step: str | None = None
     alerts: list[ScreenAlert] = []
 
 
-class FrameInfo(BaseModel):
+class FrameInfo(_Base):
     frame_id: str
     parent_frame_id: str | None = None
     url: str | None = None
 
 
-class SelectOption(BaseModel):
+class SelectOption(_Base):
     value: str
     text: str
 
 
-class InteractiveElement(BaseModel):
+class InteractiveElement(_Base):
     id: str
     frame_id: str
     tag: str
@@ -41,7 +49,7 @@ class InteractiveElement(BaseModel):
     enabled: bool
 
 
-class PageState(BaseModel):
+class PageState(_Base):
     url: str
     title: str
     screen_meta: ScreenMeta
@@ -49,37 +57,37 @@ class PageState(BaseModel):
     interactive_elements: list[InteractiveElement]
 
 
-class ProcessState(BaseModel):
+class ProcessState(_Base):
     goal: str
     completed_steps: list[str] = []
     current_phase: str = "started"
     visited_urls: list[str] = []
 
 
-class PlanRequest(BaseModel):
-    session_id: str
+class PlanRequest(_Base):
     user_request: str
     page_state: PageState
     previous_actions: list[dict] = []
     step: int = 0
 
 
-class Action(BaseModel):
+class Action(_Base):
     type: str
     element_id: str | None = None
     value: str | None = None
     description: str
 
 
-class OverlayTarget(BaseModel):
+class OverlayTarget(_Base):
     element_id: str
     label: str
     input_type: str
 
 
-class PlanResponse(BaseModel):
+class PlanResponse(_Base):
     plan_type: str
     actions: list[Action] = []
+    current_actions: list[Action] = []
     overlay_targets: list[OverlayTarget] = []
     description: str
     is_complete: bool
