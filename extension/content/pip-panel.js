@@ -159,6 +159,10 @@ function createPanel(savedState, styleText) {
       return;
     }
 
+    if (!chrome.runtime?.id) {
+      appendLog("[오류] 익스텐션이 재로드됐습니다. 페이지를 새로고침해주세요.");
+      return;
+    }
     appendLog(`[요청] ${text}`);
     chrome.runtime.sendMessage({ type: "USER_REQUEST", payload: text });
     input.value = "";

@@ -10,9 +10,23 @@ chrome.runtime.onActivated?.addListener(() => {
 // PiP 패널에서 오는 메시지 수신
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "USER_REQUEST") {
-    console.log("[Vorder] USER_REQUEST received:", msg.payload);
-    // Phase 4에서 실제 오케스트레이션 연결
+    const userRequest = msg.payload;
+    console.log("[Vorder] USER_REQUEST:", userRequest);
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0]) return;
+      chrome.tabs.sendMessage(tabs[0].id, { type: "COLLECT_DOM" }, (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn("[Vorder] DOM 수집 실패:", chrome.runtime.lastError.message);
+          return;
+        }
+        console.log("[Vorder] USER_REQUEST:", userRequest);
+        console.log("[Vorder] PAGE_STATE:", JSON.stringify(response.pageState, null, 2));
+      });
+    });
+
     sendResponse({ status: "ok" });
+    return true;
   }
 
   if (msg.type === "START_KEEPALIVE") {
