@@ -13,7 +13,9 @@ INTENT_PATTERNS = [
     (re.compile(r"제출|신청|확인|완료|저장"), {"button", "input"}),
 ]
 
-MAX_ELEMENTS = 80
+MAX_ELEMENTS = 20
+SCORE_THRESHOLD = 2.0   # 이 점수 미만은 관련 없다고 판단
+FALLBACK_COUNT = 10     # 임계치 통과 요소가 0개일 때 점수 상위 N개로 폴백
 
 
 def filter_elements(
@@ -23,26 +25,36 @@ def filter_elements(
     keywords = _extract_keywords(user_request)
     boosted_tags = _detect_intent_tags(user_request)
 
-    scored = []
-    for el in elements:
-        score = _score(el, keywords, boosted_tags)
-        scored.append((score, el))
+    # 점수 계산
+    scored = [(el, _score(el, keywords, boosted_tags)) for el in elements]
 
+    # 무조건 포함
     forced = [el for el in elements if _must_include(el)]
     forced_ids = {el.id for el in forced}
 
-    ranked = sorted(
-        [(s, el) for s, el in scored if el.id not in forced_ids],
-        key=lambda x: x[0],
-        reverse=True,
-    )
+    # 임계치 기반 필터링 (forced 제외)
+    passed = [
+        el for el, score in scored
+        if el.id not in forced_ids and score >= SCORE_THRESHOLD
+    ]
 
-    top = [el for _, el in ranked[: max(0, MAX_ELEMENTS - len(forced))]]
+    # 폴백: 임계치 통과 요소가 없으면 점수 상위 FALLBACK_COUNT개
+    if not passed:
+        candidates = [(el, s) for el, s in scored if el.id not in forced_ids]
+        passed = [el for el, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:FALLBACK_COUNT]]
 
+    # 전체 cap
+    remaining_slots = MAX_ELEMENTS - len(forced)
+    capped = passed[:remaining_slots]
+
+    # 원래 순서 유지
     all_ids_ordered = {el.id: i for i, el in enumerate(elements)}
-    result = sorted(forced + top, key=lambda el: all_ids_ordered.get(el.id, 9999))
+    result = sorted(forced + capped, key=lambda el: all_ids_ordered.get(el.id, 9999))
 
-    print(f"[Vorder] DOM_FILTER: {len(elements)}개 → {len(result)}개 (forced={len(forced)})")
+    print(
+        f"[Vorder] DOM_FILTER: {len(elements)}개 → {len(result)}개 "
+        f"(forced={len(forced)}, passed={len(passed)}, threshold={SCORE_THRESHOLD})"
+    )
     return result
 
 
