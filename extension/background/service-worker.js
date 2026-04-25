@@ -7,7 +7,62 @@ chrome.runtime.onActivated?.addListener(() => {
   console.log("[Vorder] Extension activated");
 });
 
+const ACTIVATED_TABS_KEY = "activatedTabIds";
 const SERVER_URL = "http://localhost:8000";
+
+async function getActivatedTabIds() {
+  const result = await chrome.storage.session.get(ACTIVATED_TABS_KEY);
+  return Array.isArray(result[ACTIVATED_TABS_KEY]) ? result[ACTIVATED_TABS_KEY] : [];
+}
+
+async function markTabActivated(tabId) {
+  const activatedTabIds = await getActivatedTabIds();
+  if (activatedTabIds.includes(tabId)) return;
+  await chrome.storage.session.set({
+    [ACTIVATED_TABS_KEY]: [...activatedTabIds, tabId],
+  });
+}
+
+async function unmarkTabActivated(tabId) {
+  const activatedTabIds = await getActivatedTabIds();
+  if (!activatedTabIds.includes(tabId)) return;
+  await chrome.storage.session.set({
+    [ACTIVATED_TABS_KEY]: activatedTabIds.filter((id) => id !== tabId),
+  });
+}
+
+async function injectPipPanel(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const url = tab?.url || "";
+  if (
+    !url ||
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("view-source:")
+  ) {
+    console.warn(`[Vorder] PiP injection skipped for unsupported page: ${url || "unknown"}`);
+    return false;
+  }
+
+  try {
+    const [{ result: hasPanel }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => Boolean(document.getElementById("vorder-pip-host")),
+    });
+    if (hasPanel) return true;
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/pip-panel.js"],
+    });
+    return true;
+  } catch (error) {
+    console.warn(`[Vorder] PiP injection failed on tab ${tabId}: ${error.message}`);
+    return false;
+  }
+}
 
 // 요청 상태 (SW 메모리에 유지)
 let currentStep = 0;
@@ -33,9 +88,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-async function handleUserRequest(userRequest) {
-  notifyPip("UPDATE_STATUS", "⟳ DOM 수집 중...");
+chrome.action.onClicked.addListener(async (tab) => {
+  const tabId = tab.id;
+  if (tabId == null) return;
 
+  const injected = await injectPipPanel(tabId);
+  if (injected) {
+    await markTabActivated(tabId);
+    return;
+  }
+
+  await unmarkTabActivated(tabId);
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
+
+  const activatedTabIds = await getActivatedTabIds();
+  if (!activatedTabIds.includes(tabId)) return;
+
+  await injectPipPanel(tabId);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  unmarkTabActivated(tabId).catch((error) => {
+    console.warn(`[Vorder] Failed to clear tab activation for ${tabId}: ${error.message}`);
+  });
+});
+
+async function handleUserRequest(userRequest) {
   // 1. DOM 수집
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tabs[0]) {
@@ -43,19 +124,22 @@ async function handleUserRequest(userRequest) {
     notifyPip("UPDATE_STATUS", "");
     return;
   }
+  const tabId = tabs[0].id;
+
+  notifyPip("UPDATE_STATUS", "⟳ DOM 수집 중...", tabId);
 
   let pageState;
   try {
-    const domResponse = await chrome.tabs.sendMessage(tabs[0].id, { type: "COLLECT_DOM" });
+    const domResponse = await chrome.tabs.sendMessage(tabId, { type: "COLLECT_DOM" });
     pageState = domResponse.pageState;
   } catch (e) {
-    notifyPip("APPEND_LOG", "[오류] DOM 수집 실패: " + e.message);
-    notifyPip("UPDATE_STATUS", "");
+    notifyPip("APPEND_LOG", "[오류] DOM 수집 실패: " + e.message, tabId);
+    notifyPip("UPDATE_STATUS", "", tabId);
     return;
   }
 
   // 2. 서버에 계획 요청
-  notifyPip("UPDATE_STATUS", "⟳ LLM 계획 수립 중...");
+  notifyPip("UPDATE_STATUS", "⟳ LLM 계획 수립 중...", tabId);
 
   let plan;
   try {
@@ -77,8 +161,8 @@ async function handleUserRequest(userRequest) {
 
     plan = await res.json();
   } catch (e) {
-    notifyPip("APPEND_LOG", "[오류] 서버 연결 실패: " + e.message);
-    notifyPip("UPDATE_STATUS", "");
+    notifyPip("APPEND_LOG", "[오류] 서버 연결 실패: " + e.message, tabId);
+    notifyPip("UPDATE_STATUS", "", tabId);
     return;
   }
 
@@ -89,15 +173,25 @@ async function handleUserRequest(userRequest) {
   previousActions = plan.currentActions || [];
   currentStep++;
 
-  notifyPip("APPEND_LOG", `[계획] ${plan.description}`);
-  notifyPip("UPDATE_STATUS", plan.isComplete ? "✓ 완료" : "⟳ 실행 대기 중...");
+  notifyPip("APPEND_LOG", `[계획] ${plan.description}`, tabId);
+  notifyPip("UPDATE_STATUS", plan.isComplete ? "✓ 완료" : "⟳ 실행 대기 중...", tabId);
   // Phase 5에서 plan.actions 기반 CDP 실행 추가 예정
 }
 
-function notifyPip(type, payload) {
+function notifyPip(type, payload, targetTabId = null) {
+  const sendMessage = (tabId) => {
+    if (tabId == null) return;
+    chrome.tabs.sendMessage(tabId, { type, payload }).catch(() => {});
+  };
+
+  if (targetTabId != null) {
+    sendMessage(targetTabId);
+    return;
+  }
+
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (!tabs[0]) return;
-    chrome.tabs.sendMessage(tabs[0].id, { type, payload });
+    sendMessage(tabs[0].id);
   });
 }
 
