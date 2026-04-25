@@ -4,26 +4,17 @@
   "version": "0.1.0",
   "description": "공공사이트 업무 자동화 크롬 익스텐션",
   "permissions": ["debugger", "activeTab", "scripting", "storage", "alarms"],
-  "host_permissions": [
-    "https://www.gov.kr/*",
-    "https://*.gov.kr/*",
-    "http://localhost:8000/*"
-  ],
+  "host_permissions": ["<all_urls>", "http://localhost:8000/*"],
   "background": {
     "service_worker": "background/service-worker.js"
   },
-  "content_scripts": [
-    {
-      "matches": ["https://www.gov.kr/*", "https://*.gov.kr/*"],
-      "js": ["content/pip-panel.js", "content/collector.js"],
-      "css": ["styles/pip-panel.css"],
-      "run_at": "document_idle"
-    }
-  ],
+  "action": {
+    "default_title": "Vorder 활성화"
+  },
   "web_accessible_resources": [
     {
       "resources": ["styles/*.css"],
-      "matches": ["https://www.gov.kr/*", "https://*.gov.kr/*"]
+      "matches": ["<all_urls>"]
     }
   ],
   "icons": {
