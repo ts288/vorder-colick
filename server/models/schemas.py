@@ -31,8 +31,9 @@ class SelectOption(_Base):
 
 
 class InteractiveElement(_Base):
-    id: str
+    node_id: int
     frame_id: str
+    name: str
     tag: str
     type: str | None = None
     role: str | None = None
@@ -42,10 +43,9 @@ class InteractiveElement(_Base):
     placeholder: str | None = None
     value: str | None = None
     checked: bool | None = None
-    name: str | None = None
+    input_name: str | None = None
     required: bool = False
     options: list[SelectOption] | None = None
-    selector: str
     enabled: bool
 
 
@@ -73,13 +73,17 @@ class PlanRequest(_Base):
 
 class Action(_Base):
     type: str
-    element_id: str | None = None
+    node_id: int | None = None
+    name: str | None = None
     value: str | None = None
     description: str
+    navigates: bool = False
+    result: str | None = None
 
 
 class OverlayTarget(_Base):
-    element_id: str
+    node_id: int
+    name: str
     label: str
     input_type: str
 

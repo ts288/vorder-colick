@@ -1,3 +1,5 @@
+(function () {
+
 const DEFAULT_STATE = {
   minimized: false,
   position: { x: 20, y: 20 },
@@ -106,6 +108,15 @@ function createPanel(savedState, styleText) {
   document.body.appendChild(host);
 
   renderLogs(logEl, pipState.logs);
+  chrome.runtime.sendMessage({ type: "GET_LOG_BUFFER" }, (response) => {
+    if (chrome.runtime.lastError || !response || !Array.isArray(response.logs)) {
+      return;
+    }
+    const existingLogs = new Set(pipState.logs);
+    response.logs.filter((message) => !existingLogs.has(message)).forEach((message) => {
+      appendLog(message);
+    });
+  });
   applyMinimizedState();
 
   let dragging = false;
@@ -167,6 +178,7 @@ function createPanel(savedState, styleText) {
     sendBtn.disabled = true;
     input.value = "";
     saveInputValue("");
+    setTimeout(() => { input.value = ""; saveInputValue(""); }, 0);
     chrome.runtime.sendMessage({ type: "USER_REQUEST", payload: text });
   });
 
@@ -256,3 +268,5 @@ function normalizeState(state) {
     logs: Array.isArray(state?.logs) ? state.logs.slice(0, 50) : [],
   };
 }
+
+})();
