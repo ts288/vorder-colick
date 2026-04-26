@@ -57,11 +57,24 @@ class PageState(_Base):
     interactive_elements: list[InteractiveElement]
 
 
+class NextHint(_Base):
+    keywords: list[str] = []
+    preferred_tags: list[str] = []
+    expected_action: str | None = None
+
+
+class Intent(_Base):
+    subject: str
+    verb: str
+
+
 class ProcessState(_Base):
     goal: str
     completed_steps: list[str] = []
     current_phase: str = "started"
     visited_urls: list[str] = []
+    last_next_hint: NextHint | None = None
+    intent: Intent | None = None
 
 
 class PlanRequest(_Base):
@@ -88,10 +101,18 @@ class OverlayTarget(_Base):
     input_type: str
 
 
+class Reasoning(_Base):
+    current_basis: str
+    next_prediction: str
+
+
 class PlanResponse(_Base):
+    reasoning: Reasoning
     plan_type: str
     actions: list[Action] = []
     current_actions: list[Action] = []
     overlay_targets: list[OverlayTarget] = []
     description: str
     is_complete: bool
+    next_hint: NextHint | None = None
+    intent: Intent | None = None
