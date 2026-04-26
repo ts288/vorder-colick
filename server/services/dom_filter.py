@@ -30,17 +30,17 @@ def filter_elements(
 
     # 무조건 포함
     forced = [el for el in elements if _must_include(el)]
-    forced_ids = {el.id for el in forced}
+    forced_ids = {el.node_id for el in forced}
 
     # 임계치 기반 필터링 (forced 제외)
     passed = [
         el for el, score in scored
-        if el.id not in forced_ids and score >= SCORE_THRESHOLD
+        if el.node_id not in forced_ids and score >= SCORE_THRESHOLD
     ]
 
     # 폴백: 임계치 통과 요소가 없으면 점수 상위 FALLBACK_COUNT개
     if not passed:
-        candidates = [(el, s) for el, s in scored if el.id not in forced_ids]
+        candidates = [(el, s) for el, s in scored if el.node_id not in forced_ids]
         passed = [el for el, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:FALLBACK_COUNT]]
 
     # 전체 cap
@@ -48,8 +48,8 @@ def filter_elements(
     capped = passed[:remaining_slots]
 
     # 원래 순서 유지
-    all_ids_ordered = {el.id: i for i, el in enumerate(elements)}
-    result = sorted(forced + capped, key=lambda el: all_ids_ordered.get(el.id, 9999))
+    all_ids_ordered = {el.node_id: i for i, el in enumerate(elements)}
+    result = sorted(forced + capped, key=lambda el: all_ids_ordered.get(el.node_id, 9999))
 
     print(
         f"[Vorder] DOM_FILTER: {len(elements)}개 → {len(result)}개 "

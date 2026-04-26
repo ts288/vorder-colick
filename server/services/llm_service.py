@@ -65,21 +65,21 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
 
     print(f"[Vorder] LLM_PROVIDER: {provider}")
 
-    valid_ids = {el.id for el in request.page_state.interactive_elements}
+    valid_node_ids = {el.node_id for el in request.page_state.interactive_elements}
 
     valid_actions = []
     for action in plan.actions:
-        if action.element_id is None or action.element_id in valid_ids:
+        if action.node_id is None or action.node_id in valid_node_ids:
             valid_actions.append(action)
         else:
-            print(f"[Vorder] 유효하지 않은 element_id 제거: {action.element_id}")
+            print(f"[Vorder] 유효하지 않은 node_id 제거: {action.node_id}")
 
     valid_overlay_targets = []
     for target in plan.overlay_targets:
-        if target.element_id in valid_ids:
+        if target.node_id in valid_node_ids:
             valid_overlay_targets.append(target)
         else:
-            print(f"[Vorder] 유효하지 않은 overlay element_id 제거: {target.element_id}")
+            print(f"[Vorder] 유효하지 않은 overlay node_id 제거: {target.node_id}")
 
     plan.actions = valid_actions
     plan.overlay_targets = valid_overlay_targets
