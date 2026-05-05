@@ -158,6 +158,7 @@ async function runAutomationLoop(userRequest) {
     }
   }
 
+  const attachedIframeTargetIds = new Set();
   try {
     const debuggee = { tabId };
     await ensureCdpDomains(debuggee);
@@ -170,9 +171,13 @@ async function runAutomationLoop(userRequest) {
 
     while (step < MAX_STEPS) {
       notifyPip("UPDATE_STATUS", `⟳ DOM 수집 중... (${step + 1}/${MAX_STEPS})`, tabId);
+      for (const targetId of attachedIframeTargetIds) {
+        try { await chrome.debugger.detach({ targetId }); } catch (_) {}
+      }
+      attachedIframeTargetIds.clear();
       let pageState;
       try {
-        pageState = await collectPageStateViaCdp(tabId);
+        pageState = await collectPageStateViaCdp(tabId, attachedIframeTargetIds);
       } catch (e) {
         notifyPip("APPEND_LOG", "[오류] DOM 수집 실패: " + e.message, tabId);
         break;
@@ -186,7 +191,10 @@ async function runAutomationLoop(userRequest) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             userRequest,
-            pageState,
+            pageState: {
+              ...pageState,
+              interactiveElements: pageState.interactiveElements.map(cleanForLlm),
+            },
             previousActions: allPreviousActions,
             step,
           }),
@@ -317,7 +325,11 @@ async function runAutomationLoop(userRequest) {
 
         if (snapshotBefore !== null) {
           try {
-            currentPageState = await collectPageStateViaCdp(tabId);
+            for (const targetId of attachedIframeTargetIds) {
+              try { await chrome.debugger.detach({ targetId }); } catch (_) {}
+            }
+            attachedIframeTargetIds.clear();
+            currentPageState = await collectPageStateViaCdp(tabId, attachedIframeTargetIds);
             const snapshotAfter = getDomSnapshot(currentPageState);
             if (snapshotAfter === snapshotBefore) {
               resultStr = "no_dom_change";
@@ -348,6 +360,9 @@ async function runAutomationLoop(userRequest) {
       notifyPip("UPDATE_STATUS", "", tabId);
     }
   } finally {
+    for (const targetId of attachedIframeTargetIds) {
+      try { await chrome.debugger.detach({ targetId }); } catch (_) {}
+    }
     if (attached) {
       try {
         await chrome.debugger.detach({ tabId });
@@ -358,6 +373,12 @@ async function runAutomationLoop(userRequest) {
     }
     chrome.alarms.clear("keepAlive");
   }
+}
+
+async function ensureCdpDomains(debuggee) {
+  await cdpCommand(debuggee, "Page.enable");
+  await cdpCommand(debuggee, "DOM.enable");
+  await cdpCommand(debuggee, "Runtime.enable");
 }
 
 async function enrichOverlayTargets(tabId, overlayTargets, interactiveElements) {
@@ -398,6 +419,7 @@ async function injectOverlay(tabId) {
     files: ["content/overlay.js"],
   });
 
+  // main world에 window.open 패치 주입 (CSP 우회)
   await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
@@ -410,6 +432,7 @@ function patchWindowOpen() {
   window.__vorderOpenPatched = true;
   const orig = window.open;
   window.open = function (...args) {
+    // 첫 호출 시 자동 복원 (overlay 없는 상태에서 팝업 열어도 영구 패치 안 됨)
     window.open = orig;
     delete window.__vorderOpenPatched;
     window.dispatchEvent(new CustomEvent('vorder-popup-opened'));
@@ -471,26 +494,12 @@ async function waitForOverlayComplete(tabId) {
 async function removeOverlay(tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: "HIDE_OVERLAY" });
-  } catch (_) {}
+  } catch (_) {
+    // overlay.js already removed
+  }
 }
 
-function getCdpNodeId(element) {
-  return element.__cdpNodeId ?? element.nodeId;
-}
-
-function getDebuggeeForElement(tabId, element) {
-  return element.__iframeTargetId
-    ? { targetId: element.__iframeTargetId }
-    : { tabId };
-}
-
-async function ensureCdpDomains(debuggee) {
-  await cdpCommand(debuggee, "Page.enable");
-  await cdpCommand(debuggee, "DOM.enable");
-  await cdpCommand(debuggee, "Runtime.enable");
-}
-
-async function collectPageStateViaCdp(tabId, sessionTargetId) {
+async function collectPageStateViaCdp(tabId, attachedIframeTargetIds = new Set()) {
   const debuggee = { tabId };
   await ensureCdpDomains(debuggee);
 
@@ -503,7 +512,9 @@ async function collectPageStateViaCdp(tabId, sessionTargetId) {
 
   const frameMap = buildFrameMap(frameTreeResult.frameTree);
   const candidates = [];
-  walkDomTree(documentResult.root, frameMap.mainFrameId, candidates);
+  const iframeNodeMap = new Map();
+  const contentDocFrameIds = new Set();
+  walkDomTree(documentResult.root, frameMap.mainFrameId, candidates, iframeNodeMap, contentDocFrameIds);
 
   const interactiveElements = [];
   let fallbackIndex = 0;
@@ -542,7 +553,12 @@ async function collectPageStateViaCdp(tabId, sessionTargetId) {
     });
   }
 
-  const sortedElements = prioritizeInteractiveElements(interactiveElements);
+  const iframeElements = await collectCrossOriginIframeElements(
+    tabId, frameTreeResult, iframeNodeMap, attachedIframeTargetIds, contentDocFrameIds
+  );
+
+  const allElements = iframeElements.length > 0 ? iframeElements : interactiveElements;
+  const sortedElements = prioritizeInteractiveElements(allElements);
   const frames = frameMap.frames;
   const title = await getDocumentTitle(debuggee);
   const url = (await chrome.tabs.get(tabId)).url || "";
@@ -556,7 +572,7 @@ async function collectPageStateViaCdp(tabId, sessionTargetId) {
   };
 }
 
-function walkDomTree(node, currentFrameCdpId, out) {
+function walkDomTree(node, currentFrameCdpId, out, iframeNodeMap, contentDocFrameIds = null) {
   if (!node) return;
 
   const tag = String(node.nodeName || "").toLowerCase();
@@ -572,20 +588,208 @@ function walkDomTree(node, currentFrameCdpId, out) {
 
   if (Array.isArray(node.shadowRoots)) {
     for (const shadowRoot of node.shadowRoots) {
-      walkDomTree(shadowRoot, currentFrameCdpId, out);
+      walkDomTree(shadowRoot, currentFrameCdpId, out, iframeNodeMap, contentDocFrameIds);
     }
+  }
+
+  if (tag === "iframe") {
+    console.log("[Vorder][iframe-diag] iframe node:", {
+      hasContentDoc: !!node.contentDocument,
+      hasFrameId: !!node.frameId,
+      frameId: node.frameId,
+      src: attributesToObject(node.attributes || []).src,
+    });
   }
 
   if (node.contentDocument) {
     const nextFrameCdpId = node.contentDocument.frameId || currentFrameCdpId;
-    walkDomTree(node.contentDocument, nextFrameCdpId, out);
+    if (nextFrameCdpId && contentDocFrameIds) contentDocFrameIds.add(nextFrameCdpId);
+    walkDomTree(node.contentDocument, nextFrameCdpId, out, iframeNodeMap, contentDocFrameIds);
+  } else if (tag === "iframe" && node.frameId) {
+    iframeNodeMap?.set(node.frameId, node.nodeId);
   }
 
   if (Array.isArray(node.children)) {
     for (const child of node.children) {
-      walkDomTree(child, currentFrameCdpId, out);
+      walkDomTree(child, currentFrameCdpId, out, iframeNodeMap, contentDocFrameIds);
     }
   }
+}
+
+async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNodeMap, attachedIframeTargetIds, contentDocFrameIds) {
+  const mainDebuggee = { tabId };
+  const allFrames = collectChildFrames(frameTreeResult.frameTree);
+  const viewport = await getViewportSize(mainDebuggee);
+  const iframeElements = [];
+  let syntheticId = 10_000_000;
+
+  console.log("[Vorder][iframe-diag] allFrames:", allFrames.length, allFrames.map((f) => f.frame.id));
+  console.log("[Vorder][iframe-diag] iframeNodeMap (before fill):", [...iframeNodeMap.entries()]);
+
+  // Fill missing iframeNodeMap entries via DOM.getFrameOwner for cross-origin frames
+  for (const childFrame of allFrames) {
+    const frameId = childFrame.frame.id;
+    if (contentDocFrameIds.has(frameId)) continue;
+    if (iframeNodeMap.has(frameId)) continue;
+    try {
+      const ownerResult = await cdpCommand(mainDebuggee, "DOM.getFrameOwner", { frameId });
+      const pushResult = await cdpCommand(mainDebuggee, "DOM.pushNodesByBackendIdsToFrontend", {
+        backendNodeIds: [ownerResult.backendNodeId],
+      });
+      const nodeId = pushResult.nodeIds[0];
+      if (nodeId) {
+        iframeNodeMap.set(frameId, nodeId);
+        console.log("[Vorder][iframe-diag] DOM.getFrameOwner filled:", frameId, "→ nodeId:", nodeId);
+      }
+    } catch (e) {
+      console.warn("[Vorder][iframe-diag] DOM.getFrameOwner failed:", frameId, e.message);
+    }
+  }
+
+  // Collect same-origin iframe elements via Page.createIsolatedWorld (no separate attach needed)
+  for (const childFrame of allFrames) {
+    const frameId = childFrame.frame.id;
+
+    if (contentDocFrameIds.has(frameId)) {
+      console.log("[Vorder][iframe-diag] skip (already collected via contentDocument):", frameId);
+      continue;
+    }
+
+    if (!iframeNodeMap.has(frameId)) {
+      console.log("[Vorder][iframe-diag] skip (no host nodeId):", frameId);
+      continue;
+    }
+
+    const hostNodeId = iframeNodeMap.get(frameId);
+    const hostBox = await getBoxModelSafe(mainDebuggee, hostNodeId);
+    if (!hostBox) continue;
+    const hostOffsetX = Math.min(...hostBox.border.filter((_, i) => i % 2 === 0));
+    const hostOffsetY = Math.min(...hostBox.border.filter((_, i) => i % 2 === 1));
+
+    try {
+      const worldResult = await cdpCommand(mainDebuggee, "Page.createIsolatedWorld", {
+        frameId,
+        worldName: "vorder-collect",
+        grantUniversalAccess: false,
+      });
+      const executionContextId = worldResult.executionContextId;
+
+      const evalResult = await cdpCommand(mainDebuggee, "Runtime.evaluate", {
+        expression: `(function() {
+  const normalize = (value, max) => {
+    if (value == null) return null;
+    const cleaned = String(value).replace(/\\s+/g, " ").trim();
+    if (!cleaned) return null;
+    return cleaned.slice(0, max || 80);
+  };
+  const SELECTORS = [
+    'input:not([type="hidden"]):not([aria-hidden="true"])',
+    'button:not([aria-hidden="true"])',
+    'select:not([aria-hidden="true"])',
+    'textarea:not([aria-hidden="true"])',
+    'a[href]:not([aria-hidden="true"])',
+    '[role="button"]:not([aria-hidden="true"])',
+    '[role="link"]:not([aria-hidden="true"])',
+    '[role="checkbox"]:not([aria-hidden="true"])',
+    '[role="radio"]:not([aria-hidden="true"])',
+  ].join(",");
+  const elements = [];
+  let idx = 0;
+  for (const el of document.querySelectorAll(SELECTORS)) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const tag = (el.tagName || "").toLowerCase();
+    const ariaLabel = normalize(el.getAttribute("aria-label"), 80);
+    const placeholder = normalize(el.placeholder || el.getAttribute("placeholder"), 80);
+    const inputName = normalize(el.getAttribute("name"), 80);
+    const title = normalize(el.getAttribute("title"), 80);
+    const visibleText = normalize(el.innerText || el.textContent || "", 80);
+    const getLabelText = () => {
+      if (el.labels && el.labels.length) {
+        return normalize(Array.from(el.labels).map(l => l.innerText).join(" "), 80);
+      }
+      const parentLabel = typeof el.closest === "function" && el.closest("label");
+      return parentLabel ? normalize(parentLabel.innerText, 80) : null;
+    };
+    const getNearbyText = () => {
+      let node = el.parentElement;
+      while (node && node !== document.body) {
+        const heading = node.querySelector("h1,h2,h3,h4,legend");
+        if (heading) { const t = normalize(heading.innerText, 80); if (t) return t; }
+        node = node.parentElement;
+      }
+      const prev = el.previousElementSibling;
+      return prev && prev.innerText ? normalize(prev.innerText, 80) : null;
+    };
+    const labelText = getLabelText();
+    const nearbyText = getNearbyText();
+    const semanticName = ariaLabel || labelText || visibleText || placeholder || inputName || title || nearbyText || (tag + "#" + idx);
+    let value = null;
+    if ("value" in el && typeof el.value === "string" && el.value) {
+      value = el.type === "password" ? "[MASKED]" : el.value.slice(0, 200);
+    }
+    let options = null;
+    if (tag === "select" && el.options) {
+      options = Array.from(el.options).map(opt => ({ value: String(opt.value ?? ""), text: normalize(opt.text, 200) || "" }));
+    }
+    const inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+    elements.push({
+      tag, type: el.getAttribute("type") || null, role: el.getAttribute("role") || null,
+      name: semanticName, text: normalize(el.innerText || el.value || ariaLabel || "", 200) || "",
+      ariaLabel, nearbyText, placeholder: el.type === "password" ? "[비밀번호]" : placeholder,
+      value, checked: "checked" in el ? Boolean(el.checked) : null,
+      required: Boolean(el.required), enabled: !el.disabled, inputName, options, inViewport,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    });
+    idx++;
+  }
+  return JSON.stringify(elements);
+})()`,
+        contextId: executionContextId,
+        returnByValue: true,
+      });
+
+      if (evalResult.result?.type !== "string") {
+        console.warn("[Vorder][iframe-diag] Runtime.evaluate non-string result:", frameId, evalResult.result?.type);
+        continue;
+      }
+
+      const elements = JSON.parse(evalResult.result.value);
+      console.log("[Vorder][iframe-diag] same-origin iframe elements:", frameId, elements.length);
+
+      for (const el of elements) {
+        const absX = hostOffsetX + el.rect.x;
+        const absY = hostOffsetY + el.rect.y;
+        const inViewport = el.inViewport && isPointInViewport({ x: absX + el.rect.width / 2, y: absY + el.rect.height / 2 }, viewport);
+        iframeElements.push({
+          nodeId: syntheticId++,
+          __cdpNodeId: null,
+          __iframeTargetId: null,
+          precomputedRect: { x: absX, y: absY, width: el.rect.width, height: el.rect.height },
+          frameId: `iframe-${frameId.slice(0, 8)}`,
+          name: el.name,
+          tag: el.tag,
+          type: el.type,
+          role: el.role || inferRole(el.tag),
+          text: el.text,
+          ariaLabel: el.ariaLabel,
+          nearbyText: el.nearbyText,
+          placeholder: el.placeholder,
+          value: el.value,
+          checked: el.checked,
+          inputName: el.inputName,
+          required: el.required,
+          options: el.options,
+          enabled: el.enabled,
+          __inViewport: inViewport,
+        });
+      }
+    } catch (e) {
+      console.warn("[Vorder][iframe-diag] isolated world collection failed:", frameId, e.message);
+    }
+  }
+
+  return iframeElements;
 }
 
 async function collectScreenMeta(debuggee) {
@@ -824,38 +1028,43 @@ async function showClickIndicator(debuggee, x, y) {
 
 async function cdpClickByNodeId(tabId, action, elements) {
   const resolved = await resolveByNodeIdOrName(tabId, action, elements);
-  const debuggee = { tabId };
-  const state = await getElementState(debuggee, resolved.element.nodeId);
+  const { debuggee, cdpNodeId } = resolved;
+  const inputDebuggee = { tabId };
+
+  const state = await getElementState(debuggee, cdpNodeId);
   if (!state.found) throw new DomStaleError("not_found", action.name || action.nodeId);
   if (!state.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
+
   let box = resolved.box;
-  const viewport = await getViewportSize(debuggee);
+  const viewport = await getViewportSize(inputDebuggee);
   let point = getBoxCenter(box);
 
   if (!isPointInViewport(point, viewport)) {
-    await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: resolved.element.nodeId });
-    box = await requireBoxModel(debuggee, resolved.element.nodeId, action.name);
+    await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
+    box = resolved.element.precomputedRect
+      ? resolved.box
+      : await requireBoxModel(debuggee, cdpNodeId, action.name);
     point = getBoxCenter(box);
   }
 
-  await showClickIndicator(debuggee, point.x, point.y);
+  await showClickIndicator(inputDebuggee, point.x, point.y);
   await sleep(100);
 
-  await cdpCommand(debuggee, "Input.dispatchMouseEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchMouseEvent", {
     type: "mouseMoved",
     x: point.x,
     y: point.y,
     button: "left",
     clickCount: 1,
   });
-  await cdpCommand(debuggee, "Input.dispatchMouseEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchMouseEvent", {
     type: "mousePressed",
     x: point.x,
     y: point.y,
     button: "left",
     clickCount: 1,
   });
-  await cdpCommand(debuggee, "Input.dispatchMouseEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchMouseEvent", {
     type: "mouseReleased",
     x: point.x,
     y: point.y,
@@ -870,24 +1079,23 @@ async function cdpTypeByNodeId(tabId, action, elements) {
   if (action.value == null) throw new Error("type: value 필요");
 
   const resolved = await resolveByNodeIdOrName(tabId, action, elements);
-  const debuggee = { tabId };
-  await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: resolved.element.nodeId });
-  const editable = await getElementState(debuggee, resolved.element.nodeId);
+  const { debuggee, cdpNodeId } = resolved;
+  const inputDebuggee = { tabId };
+
+  await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
+  const editable = await getElementState(debuggee, cdpNodeId);
   if (!editable.found) throw new DomStaleError("not_found", action.name || action.nodeId);
   if (!editable.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
   if (!editable.editable) throw new DomStaleError("not_editable", action.name || action.nodeId);
 
-  const typeBox = await getBoxModelSafe(debuggee, resolved.element.nodeId);
-  if (typeBox) {
-    const typePoint = getBoxCenter(typeBox);
-    await showClickIndicator(debuggee, typePoint.x, typePoint.y);
-    await sleep(100);
-  }
+  const typePoint = getBoxCenter(resolved.box);
+  await showClickIndicator(inputDebuggee, typePoint.x, typePoint.y);
+  await sleep(100);
 
-  await cdpCommand(debuggee, "DOM.focus", { nodeId: resolved.element.nodeId });
-  await clearFocusedValue(debuggee, resolved.element.nodeId);
-  await cdpCommand(debuggee, "Input.insertText", { text: String(action.value) });
-  await dispatchInputEvents(debuggee, resolved.element.nodeId);
+  await cdpCommand(debuggee, "DOM.focus", { nodeId: cdpNodeId });
+  await clearFocusedValue(debuggee, cdpNodeId, inputDebuggee);
+  await cdpCommand(inputDebuggee, "Input.insertText", { text: String(action.value) });
+  await dispatchInputEvents(debuggee, cdpNodeId);
 
   return { result: resolved.usedFallback ? "success_fallback" : "success" };
 }
@@ -896,20 +1104,19 @@ async function cdpSelectByNodeId(tabId, action, elements) {
   if (action.value == null) throw new Error("select: value 필요");
 
   const resolved = await resolveByNodeIdOrName(tabId, action, elements);
-  const debuggee = { tabId };
-  await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: resolved.element.nodeId });
-  const editable = await getElementState(debuggee, resolved.element.nodeId);
+  const { debuggee, cdpNodeId } = resolved;
+  const inputDebuggee = { tabId };
+
+  await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
+  const editable = await getElementState(debuggee, cdpNodeId);
   if (!editable.found) throw new DomStaleError("not_found", action.name || action.nodeId);
   if (!editable.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
 
-  const selectBox = await getBoxModelSafe(debuggee, resolved.element.nodeId);
-  if (selectBox) {
-    const selectPoint = getBoxCenter(selectBox);
-    await showClickIndicator(debuggee, selectPoint.x, selectPoint.y);
-    await sleep(100);
-  }
+  const selectPoint = getBoxCenter(resolved.box);
+  await showClickIndicator(inputDebuggee, selectPoint.x, selectPoint.y);
+  await sleep(100);
 
-  const objectId = await resolveNodeObjectId(debuggee, resolved.element.nodeId);
+  const objectId = await resolveNodeObjectId(debuggee, cdpNodeId);
   try {
     const response = await cdpCommand(debuggee, "Runtime.callFunctionOn", {
       objectId,
@@ -935,15 +1142,18 @@ async function cdpSelectByNodeId(tabId, action, elements) {
 }
 
 async function resolveByNodeIdOrName(tabId, action, elements) {
-  const debuggee = { tabId };
   const targetElement = action.nodeId == null
     ? null
     : elements.find((element) => element.nodeId === action.nodeId);
 
   if (targetElement) {
-    const box = await getBoxModelSafe(debuggee, targetElement.nodeId);
+    const debuggee = getDebuggeeForElement(tabId, targetElement);
+    const cdpNodeId = getCdpNodeId(targetElement);
+    const box = targetElement.precomputedRect
+      ? boxFromPrecomputedRect(targetElement.precomputedRect)
+      : await getBoxModelSafe(debuggee, cdpNodeId);
     if (box && !isZeroSized(box)) {
-      return { element: targetElement, box, usedFallback: false };
+      return { element: targetElement, box, debuggee, cdpNodeId, usedFallback: false };
     }
   }
 
@@ -952,11 +1162,15 @@ async function resolveByNodeIdOrName(tabId, action, elements) {
     throw new DomStaleError("not_found", action.name || action.nodeId);
   }
 
-  const box = await requireBoxModel(debuggee, fallback.nodeId, action.name);
+  const debuggee = getDebuggeeForElement(tabId, fallback);
+  const cdpNodeId = getCdpNodeId(fallback);
+  const box = fallback.precomputedRect
+    ? boxFromPrecomputedRect(fallback.precomputedRect)
+    : await requireBoxModel(debuggee, cdpNodeId, action.name);
   const message = `[FALLBACK] nodeId ${action.nodeId} → name "${action.name}" 로 매칭`;
   console.warn(message);
   notifyPip("APPEND_LOG", message, tabId);
-  return { element: fallback, box, usedFallback: true };
+  return { element: fallback, box, debuggee, cdpNodeId, usedFallback: true };
 }
 
 function resolveByName(action, elements) {
@@ -1127,6 +1341,31 @@ function inferRole(tag) {
   return null;
 }
 
+function safeOrigin(url) {
+  try { return new URL(url).origin; } catch (_) { return ""; }
+}
+
+function getCdpNodeId(element) {
+  return element.__cdpNodeId ?? element.nodeId;
+}
+
+function getDebuggeeForElement(tabId, element) {
+  return element?.__iframeTargetId ? { targetId: element.__iframeTargetId } : { tabId };
+}
+
+function collectChildFrames(frameTree) {
+  const result = [];
+  for (const child of frameTree.childFrames || []) {
+    result.push(child);
+    result.push(...collectChildFrames(child));
+  }
+  return result;
+}
+
+function cleanForLlm({ __cdpNodeId, __iframeTargetId, precomputedRect, ...rest }) {
+  return rest;
+}
+
 async function getElementState(debuggee, nodeId) {
   const objectId = await resolveNodeObjectId(debuggee, nodeId);
   try {
@@ -1147,7 +1386,7 @@ async function getElementState(debuggee, nodeId) {
   }
 }
 
-async function clearFocusedValue(debuggee, nodeId) {
+async function clearFocusedValue(debuggee, nodeId, inputDebuggee = debuggee) {
   try {
     await cdpCommand(debuggee, "DOM.setAttributeValue", {
       nodeId,
@@ -1170,7 +1409,7 @@ async function clearFocusedValue(debuggee, nodeId) {
     await releaseObject(debuggee, objectId);
   }
 
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "rawKeyDown",
     key: "Meta",
     code: "MetaLeft",
@@ -1178,7 +1417,7 @@ async function clearFocusedValue(debuggee, nodeId) {
     nativeVirtualKeyCode: 91,
     modifiers: 4,
   });
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "a",
     code: "KeyA",
@@ -1186,7 +1425,7 @@ async function clearFocusedValue(debuggee, nodeId) {
     nativeVirtualKeyCode: 65,
     modifiers: 4,
   });
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "keyUp",
     key: "a",
     code: "KeyA",
@@ -1194,21 +1433,21 @@ async function clearFocusedValue(debuggee, nodeId) {
     nativeVirtualKeyCode: 65,
     modifiers: 4,
   });
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "keyUp",
     key: "Meta",
     code: "MetaLeft",
     windowsVirtualKeyCode: 91,
     nativeVirtualKeyCode: 91,
   });
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "Backspace",
     code: "Backspace",
     windowsVirtualKeyCode: 8,
     nativeVirtualKeyCode: 8,
   });
-  await cdpCommand(debuggee, "Input.dispatchKeyEvent", {
+  await cdpCommand(inputDebuggee, "Input.dispatchKeyEvent", {
     type: "keyUp",
     key: "Backspace",
     code: "Backspace",
@@ -1271,6 +1510,11 @@ function isZeroSized(box) {
   const height = Math.abs(box.height || 0);
   if (width === 0 || height === 0) return true;
   return false;
+}
+
+function boxFromPrecomputedRect({ x, y, width, height }) {
+  const border = [x, y, x + width, y, x + width, y + height, x, y + height];
+  return { border, content: border, width, height };
 }
 
 function getBoxCenter(box) {
