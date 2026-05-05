@@ -209,9 +209,40 @@ async function runAutomationLoop(userRequest) {
         break;
       }
       if (plan.planType === "overlay") {
-        notifyPip("APPEND_LOG", "[안내] 민감정보 입력 필요 (Phase 6에서 처리)", tabId);
+        notifyPip("APPEND_LOG", `[안내] 직접 입력 필요: ${plan.description}`, tabId);
+        notifyPip("UPDATE_STATUS", "⏸ 직접 입력 대기 중...", tabId);
+
+        const overlayTargets = plan.overlayTargets || [];
+        const enrichedTargets = await enrichOverlayTargets(
+          tabId,
+          overlayTargets,
+          pageState.interactiveElements
+        );
+
+        const isLogin = overlayTargets.some((target) => target.inputType === "login");
+        await injectOverlay(tabId);
+        await sendOverlayShow(tabId, enrichedTargets, isLogin);
+
+        if (isLogin) {
+          await waitForNavigationOrDismiss(tabId);
+        } else {
+          await waitForOverlayComplete(tabId);
+        }
+
+        await removeOverlay(tabId);
+        notifyPip("APPEND_LOG", "[안내] 입력 완료. 재개합니다.", tabId);
         notifyPip("UPDATE_STATUS", "", tabId);
-        break;
+
+        allPreviousActions.push({
+          type: "overlay",
+          name: overlayTargets.map((target) => target.name).join(", "),
+          description: isLogin ? "사용자가 로그인 방식 선택" : "사용자가 민감정보 직접 입력 완료",
+          result: "success",
+        });
+        allPreviousActions = allPreviousActions.slice(-20);
+
+        step++;
+        continue;
       }
       if (plan.planType === "error") {
         notifyPip("APPEND_LOG", "[오류] LLM 오류 응답", tabId);
@@ -327,6 +358,130 @@ async function runAutomationLoop(userRequest) {
     }
     chrome.alarms.clear("keepAlive");
   }
+}
+
+async function enrichOverlayTargets(tabId, overlayTargets, interactiveElements) {
+  const elementMap = new Map((interactiveElements || []).map((element) => [element.nodeId, element]));
+  const enrichedTargets = [];
+
+  for (const target of overlayTargets || []) {
+    const element = elementMap.get(target.nodeId);
+    let rect = element?.precomputedRect || null;
+    if (!rect && element) {
+      const elemDebuggee = getDebuggeeForElement(tabId, element);
+      const cdpNodeId = getCdpNodeId(element);
+      const box = await getBoxModelSafe(elemDebuggee, cdpNodeId);
+      if (box) {
+        rect = {
+          x: Math.min(...box.border.filter((_, index) => index % 2 === 0)),
+          y: Math.min(...box.border.filter((_, index) => index % 2 === 1)),
+          width: box.width,
+          height: box.height,
+        };
+      }
+    }
+    enrichedTargets.push({ ...target, rect });
+  }
+
+  return enrichedTargets;
+}
+
+async function injectOverlay(tabId) {
+  const [{ result: hasOverlay }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => Boolean(document.getElementById("vorder-overlay-host")),
+  });
+  if (hasOverlay) return;
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/overlay.js"],
+  });
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: patchWindowOpen,
+  });
+}
+
+function patchWindowOpen() {
+  if (window.__vorderOpenPatched) return;
+  window.__vorderOpenPatched = true;
+  const orig = window.open;
+  window.open = function (...args) {
+    window.open = orig;
+    delete window.__vorderOpenPatched;
+    window.dispatchEvent(new CustomEvent('vorder-popup-opened'));
+    return orig.apply(this, args);
+  };
+}
+
+async function sendOverlayShow(tabId, enrichedTargets, isLogin) {
+  await chrome.tabs.sendMessage(tabId, {
+    type: "SHOW_OVERLAY",
+    payload: { targets: enrichedTargets, isLogin },
+  });
+}
+
+async function waitForNavigationOrDismiss(tabId) {
+  return new Promise((resolve) => {
+    let resolved = false;
+
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      chrome.tabs.onUpdated.removeListener(navListener);
+      chrome.runtime.onMessage.removeListener(msgListener);
+      resolve();
+    };
+
+    const navListener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish();
+    };
+    const msgListener = (msg, sender) => {
+      if (
+        (msg.type === "OVERLAY_DISMISSED_BY_DOM" || msg.type === "OVERLAY_COMPLETE") &&
+        sender.tab?.id === tabId
+      ) {
+        finish();
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(navListener);
+    chrome.runtime.onMessage.addListener(msgListener);
+  });
+}
+
+async function waitForOverlayComplete(tabId) {
+  return new Promise((resolve) => {
+    const listener = (msg, sender) => {
+      if (
+        (msg.type === "OVERLAY_COMPLETE" || msg.type === "OVERLAY_DISMISSED_BY_DOM") &&
+        sender.tab?.id === tabId
+      ) {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve();
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+  });
+}
+
+async function removeOverlay(tabId) {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "HIDE_OVERLAY" });
+  } catch (_) {}
+}
+
+function getCdpNodeId(element) {
+  return element.__cdpNodeId ?? element.nodeId;
+}
+
+function getDebuggeeForElement(tabId, element) {
+  return element.__iframeTargetId
+    ? { targetId: element.__iframeTargetId }
+    : { tabId };
 }
 
 async function ensureCdpDomains(debuggee) {
