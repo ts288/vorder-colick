@@ -88,13 +88,17 @@
   document.documentElement.appendChild(host);
 
   const FIELD_SELECTOR = "input, textarea, select";
+  const ACTIONABLE_SELECTOR = "input, textarea, select, button, a";
   const MUTATION_DEBOUNCE_MS = 300;
 
   let observer = null;
+  let iframeObservers = [];
   let abortController = null;
   let debounceTimer = null;
   let targetStates = new Map();
   let panelMessageEl = null;
+  let currentIsLogin = false;
+  let lastIframeClickAt = 0;
 
   function isFieldFilled(domEl) {
     if (!domEl) return false;
@@ -114,8 +118,8 @@
 
     const el = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
     if (!el) return null;
-    if (el.matches?.(FIELD_SELECTOR)) return el;
-    return el.closest?.(FIELD_SELECTOR) || null;
+    if (el.matches?.(ACTIONABLE_SELECTOR)) return el;
+    return el.closest?.(ACTIONABLE_SELECTOR) || null;
   }
 
   function getRemainingTargets() {
@@ -131,7 +135,7 @@
       return;
     }
 
-    panelMessageEl.textContent = `아래 필드를 직접 입력해주세요:\n${remainingTargets
+    panelMessageEl.textContent = `아래 항목을 직접 진행해주세요:\n${remainingTargets
       .map((state) => state.target.label || state.target.name)
       .join(", ")}`;
   }
@@ -139,6 +143,9 @@
   function cleanupOverlayState() {
     observer?.disconnect();
     observer = null;
+
+    iframeObservers.forEach((iframeObserver) => iframeObserver.disconnect());
+    iframeObservers = [];
 
     abortController?.abort();
     abortController = null;
@@ -201,6 +208,63 @@
     return false;
   }
 
+  function attachIframeObserver(iframeEl) {
+    let doc;
+    try {
+      doc = iframeEl.contentDocument;
+    } catch (_) {
+      return;
+    }
+
+    if (!doc || doc.location.href === "about:blank" || !doc.body) {
+      iframeEl.addEventListener(
+        "load",
+        () => attachIframeObserver(iframeEl),
+        { once: true, signal: abortController.signal }
+      );
+      return;
+    }
+
+    doc.addEventListener(
+      "click",
+      () => {
+        lastIframeClickAt = Date.now();
+      },
+      { capture: true, signal: abortController.signal }
+    );
+
+    const iframeObserver = new MutationObserver((mutations) => {
+      const hasChildListChange = mutations.some(
+        (mutation) => mutation.type === "childList" &&
+          (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)
+      );
+      const afterClick = Date.now() - lastIframeClickAt < 700;
+      if (!hasChildListChange) return;
+
+      if (currentIsLogin || afterClick) {
+        chrome.runtime.sendMessage({ type: "OVERLAY_DISMISSED_BY_DOM" });
+        remove();
+        return;
+      }
+
+      const anyGone = [...targetStates.values()].some(
+        (state) => state.domEl && !state.domEl.isConnected
+      );
+      if (!anyGone) return;
+
+      chrome.runtime.sendMessage({ type: "OVERLAY_DISMISSED_BY_DOM" });
+      remove();
+    });
+
+    iframeObserver.observe(doc.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "hidden", "disabled", "aria-hidden"],
+    });
+    iframeObservers.push(iframeObserver);
+  }
+
   function setupMutationObserver() {
     const observedRoot = document.body;
     if (!observedRoot) return;
@@ -223,7 +287,7 @@
       debounceTimer = setTimeout(() => {
         debounceTimer = null;
         const anyGone = [...targetStates.values()].some(
-          (state) => state.domEl && !document.contains(state.domEl)
+          (state) => state.domEl && !state.domEl.isConnected
         );
         if (!anyGone) return;
 
@@ -233,10 +297,15 @@
     });
 
     observer.observe(observedRoot, { childList: true, subtree: true, attributes: false });
+
+    document.querySelectorAll("iframe").forEach((iframeEl) => {
+      attachIframeObserver(iframeEl);
+    });
   }
 
   function render({ targets, isLogin }) {
     cleanupOverlayState();
+    currentIsLogin = isLogin;
     container.innerHTML = "";
     abortController = new AbortController();
     targetStates = new Map();
@@ -267,7 +336,7 @@
 
       targetStates.set(index, { boxEl, domEl, filled, target });
 
-      if (!domEl || filled) return;
+      if (!domEl || filled || !domEl.matches?.(FIELD_SELECTOR)) return;
 
       const eventType = domEl.tagName?.toLowerCase() === "select" ? "change" : "input";
       domEl.addEventListener(
