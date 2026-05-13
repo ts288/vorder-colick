@@ -86,7 +86,6 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
     else:
         raise ValueError(f"지원하지 않는 LLM provider: {provider}")
 
-    print(f"[Vorder] LLM_PROVIDER: {provider}")
     if plan.reasoning:
         print(f"[Vorder] REASONING_CURRENT: {plan.reasoning.current_basis}")
         print(f"[Vorder] REASONING_NEXT: {plan.reasoning.next_prediction}")
@@ -109,33 +108,23 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
     for action in plan.actions:
         if action.type in requires_target:
             if action.node_id is None or not action.name:
-                print(f"[Vorder] node_id/name 없는 액션 제거: {action}")
                 continue
             if action.node_id not in valid_node_ids:
-                print(f"[Vorder] 유효하지 않은 node_id 제거: {action.node_id}")
                 continue
             if action.type == "click":
                 el = el_map[action.node_id]
                 if not _is_clickable(el):
-                    print(
-                        f"[Vorder] 클릭 불가 요소 제거: {action.node_id} "
-                        f"tag={el.tag} type={el.type}"
-                    )
                     continue
             valid_actions.append(action)
             continue
 
         if action.node_id is None or action.node_id in valid_node_ids:
             valid_actions.append(action)
-        else:
-            print(f"[Vorder] 유효하지 않은 node_id 제거: {action.node_id}")
 
     valid_overlay_targets = []
     for target in plan.overlay_targets:
         if target.node_id in valid_node_ids:
             valid_overlay_targets.append(target)
-        else:
-            print(f"[Vorder] 유효하지 않은 overlay node_id 제거: {target.node_id}")
 
     plan.actions = valid_actions
     plan.overlay_targets = valid_overlay_targets

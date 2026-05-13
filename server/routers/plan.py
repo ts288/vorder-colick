@@ -22,9 +22,18 @@ async def plan_endpoint(req: PlanRequest, app_request: Request):
     if req.page_state.url not in process_state.visited_urls:
         process_state.visited_urls.append(req.page_state.url)
 
-    print(f"\n[Vorder] USER_REQUEST: {req.user_request} (step={req.step})")
-    print(f"[Vorder] PAGE_URL: {req.page_state.url}")
-    print(f"[Vorder] ELEMENTS_TOTAL: {len(req.page_state.interactive_elements)}")
+    elements = req.page_state.interactive_elements
+    iframe_count = sum(1 for el in elements if el.frame_id != "main")
+    main_count = len(elements) - iframe_count
+    if iframe_count and main_count:
+        dom_scope = "mixed"
+    elif iframe_count:
+        dom_scope = "iframe"
+    elif main_count:
+        dom_scope = "main"
+    else:
+        dom_scope = "empty"
+    print(f"[Vorder] DOM_SCOPE: {dom_scope} (main={main_count}, iframe={iframe_count})")
 
     try:
         result = await get_plan(req, process_state)

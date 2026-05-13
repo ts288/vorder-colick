@@ -160,6 +160,7 @@ function createPanel(savedState, styleText) {
   });
 
   closeBtn.addEventListener("click", () => {
+    try { chrome.runtime.sendMessage({ type: "CLEAR_LOG_BUFFER" }); } catch { /* extension unavailable */ }
     host.remove();
     try { chrome.storage.local.remove("pipState"); } catch { /* storage unavailable */ }
   });
