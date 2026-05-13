@@ -20,6 +20,9 @@ CTA_PATTERNS = {
 }
 
 MAX_ELEMENTS = 20
+SENSITIVE_MAX_ELEMENTS = 25
+SENSITIVE_TEXT_FIELD_MAX = 15
+SENSITIVE_BUTTON_MAX = 10
 SCORE_THRESHOLD = 2.0   # 이 점수 미만은 관련 없다고 판단
 FALLBACK_COUNT = 10     # 임계치 통과 요소가 0개일 때 점수 상위 N개로 폴백
 MIN_HINT_RESULTS = 3    # hint 기반 결과가 이보다 적으면 유저 키워드 결과와 병합
@@ -60,10 +63,13 @@ def filter_elements(
     ]
 
     # 무조건 포함 (기본 규칙)
-    forced_elements = [el for el in elements if _must_include(el)]
+    # 빈 입력 필드도 overlay 후보가 되어야 하므로 텍스트 입력 계열은 항상 LLM에 전달한다.
+    forced_elements = [el for el in elements if _must_include(el) or _is_text_input_field(el)]
+
+    sensitive_mode = _needs_sensitive_context(elements, user_request, hint_kw_set)
 
     # 민감 필드는 사용자 요청 또는 hint 에 민감 맥락이 있을 때만 강제 포함
-    if _needs_sensitive_context(user_request, hint_kw_set):
+    if sensitive_mode:
         already_forced_ids = {el.node_id for el in forced_elements}
         for el in elements:
             if el.node_id in already_forced_ids:
@@ -74,35 +80,63 @@ def filter_elements(
     forced = forced_elements
     forced_ids = {el.node_id for el in forced}
 
+    relaxed_elements: list[InteractiveElement] = []
+    if sensitive_mode:
+        relaxed_elements = _collect_sensitive_mode_elements(elements, forced_ids)
+
+    relaxed_ids = {el.node_id for el in relaxed_elements}
+
     # 임계치 기반 필터링 후 점수 내림차순 정렬 (DOM 순서가 아닌 관련도 순으로 cap)
     passed_scored = sorted(
-        [(el, s) for el, s in scored if el.node_id not in forced_ids and s >= SCORE_THRESHOLD],
+        [
+            (el, s)
+            for el, s in scored
+            if el.node_id not in forced_ids
+            and el.node_id not in relaxed_ids
+            and s >= SCORE_THRESHOLD
+        ],
         key=lambda x: x[1],
         reverse=True,
     )
     passed = [el for el, _ in passed_scored]
 
     # 폴백: 임계치 통과 요소가 없으면 점수 상위 FALLBACK_COUNT개
-    if not passed:
+    if not passed and not sensitive_mode:
         candidates = [(el, s) for el, s in scored if el.node_id not in forced_ids]
         passed = [el for el, _ in sorted(candidates, key=lambda x: x[1], reverse=True)[:FALLBACK_COUNT]]
 
     # 전체 cap
-    remaining_slots = MAX_ELEMENTS - len(forced)
+    max_elements = SENSITIVE_MAX_ELEMENTS if sensitive_mode else MAX_ELEMENTS
+    remaining_slots = max(0, max_elements - len(forced) - len(relaxed_elements))
     capped = passed[:remaining_slots]
 
     # 원래 순서 유지
     all_ids_ordered = {el.node_id: i for i, el in enumerate(elements)}
-    result = sorted(forced + capped, key=lambda el: all_ids_ordered.get(el.node_id, 9999))
-
-    hint_info = f", hint_kw={list(hint_kw_set)}" if hint_kw_set else ""
-    print(
-        f"[Vorder] DOM_FILTER: {len(elements)}개 → {len(result)}개 "
-        f"(forced={len(forced)}, passed={len(passed)}, threshold={SCORE_THRESHOLD}{hint_info})"
+    result = sorted(
+        forced + relaxed_elements + capped,
+        key=lambda el: all_ids_ordered.get(el.node_id, 9999),
     )
+
     # 디버깅: 수집된 전체 요소와 필터 결과
-    all_names = [f"{el.tag}:{el.text[:20]}" for el in elements if el.text]
-    result_names = [f"{el.tag}:{el.text[:20]}" for el in result if el.text]
+    def _frame_prefix(el):
+        return f"[{el.frame_id}]" if el.frame_id != "main" else ""
+
+    def _display_text(el):
+        value = el.text or el.name or el.placeholder or el.aria_label or el.nearby_text or el.input_name
+        if not value:
+            return None
+        return value[:20]
+
+    all_names = [
+        f"{_frame_prefix(el)}{el.tag}:{text}"
+        for el in elements
+        if (text := _display_text(el))
+    ]
+    result_names = [
+        f"{_frame_prefix(el)}{el.tag}:{text}"
+        for el in result
+        if (text := _display_text(el))
+    ]
     print(f"[Vorder] DOM_ALL({len(elements)}): {all_names}")
     print(f"[Vorder] DOM_RESULT({len(result)}): {result_names}")
     return result
@@ -188,12 +222,70 @@ def _must_include(el: InteractiveElement) -> bool:
     return False
 
 
-def _needs_sensitive_context(user_request: str, hint_keywords: set[str]) -> bool:
-    """사용자 요청 또는 hint 에 민감정보 관련 맥락이 있는지 판단."""
+def _needs_sensitive_context(
+    elements: list[InteractiveElement],
+    user_request: str,
+    hint_keywords: set[str],
+) -> bool:
+    """사용자 요청/힌트 또는 페이지 구조로 민감 입력 모드가 필요한지 판단."""
     haystack = user_request or ""
     if hint_keywords:
         haystack = haystack + " " + " ".join(hint_keywords)
-    return any(kw in haystack for kw in SENSITIVE_INTENT_KW)
+    has_sensitive_request = any(kw in haystack for kw in SENSITIVE_INTENT_KW)
+    has_sensitive_field = any(
+        el.type == "password" or _is_sensitive_field(el)
+        for el in elements
+    )
+    has_text_input = any(_is_text_input_field(el) for el in elements)
+    return has_text_input and (has_sensitive_request or has_sensitive_field)
+
+
+def _collect_sensitive_mode_elements(
+    elements: list[InteractiveElement],
+    excluded_ids: set[int],
+) -> list[InteractiveElement]:
+    text_fields: list[InteractiveElement] = []
+    button_fields: list[InteractiveElement] = []
+
+    for el in elements:
+        if el.node_id in excluded_ids:
+            continue
+        if _is_text_input_field(el):
+            text_fields.append(el)
+            continue
+        if _is_sensitive_mode_button(el):
+            button_fields.append(el)
+
+    return text_fields[:SENSITIVE_TEXT_FIELD_MAX] + button_fields[:SENSITIVE_BUTTON_MAX]
+
+
+def _is_text_input_field(el: InteractiveElement) -> bool:
+    if not el.enabled:
+        return False
+    if el.tag == "textarea":
+        return True
+    return el.tag == "input" and (el.type or "text") in {
+        "text",
+        "email",
+        "tel",
+        "number",
+        "password",
+        "search",
+        "url",
+        "date",
+        "month",
+        "week",
+        "time",
+        "datetime-local",
+    }
+
+
+def _is_sensitive_mode_button(el: InteractiveElement) -> bool:
+    if not el.enabled:
+        return False
+    if el.tag in {"button", "a"}:
+        return True
+    return el.tag == "input" and el.type in {"submit", "button"}
 
 
 def _is_sensitive_field(el: InteractiveElement) -> bool:
@@ -207,6 +299,7 @@ def _is_sensitive_field(el: InteractiveElement) -> bool:
         el.placeholder or "",
         el.aria_label or "",
         el.input_name or "",
+        el.nearby_text or "",
     ]
     combined = " ".join(fields)
     return any(kw in combined for kw in SENSITIVE_FIELD_KW)
