@@ -1,11 +1,7 @@
 // 설치/활성화
-chrome.runtime.onInstalled.addListener(() => {
-  console.log("[Vorder] Extension installed");
-});
+chrome.runtime.onInstalled.addListener(() => {});
 
-chrome.runtime.onActivated?.addListener(() => {
-  console.log("[Vorder] Extension activated");
-});
+chrome.runtime.onActivated?.addListener(() => {});
 
 const ACTIVATED_TABS_KEY = "activatedTabIds";
 const SERVER_URL = "http://localhost:8000";
@@ -51,7 +47,6 @@ async function injectPipPanel(tabId) {
     url.startsWith("about:") ||
     url.startsWith("view-source:")
   ) {
-    console.warn(`[Vorder] PiP injection skipped for unsupported page: ${url || "unknown"}`);
     return false;
   }
 
@@ -68,7 +63,6 @@ async function injectPipPanel(tabId) {
     });
     return true;
   } catch (error) {
-    console.warn(`[Vorder] PiP injection failed on tab ${tabId}: ${error.message}`);
     return false;
   }
 }
@@ -85,7 +79,6 @@ class DomStaleError extends Error {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "USER_REQUEST") {
     runAutomationLoop(msg.payload).catch((e) => {
-      console.error("[Vorder] Loop error:", e);
       notifyPip("APPEND_LOG", "[오류] 루프 실패: " + e.message, sender.tab?.id ?? null);
       notifyPip("UPDATE_STATUS", "", sender.tab?.id ?? null);
     });
@@ -101,6 +94,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "GET_LOG_BUFFER") {
     sendResponse({ logs: logBuffer.slice() });
     return true;
+  }
+  if (msg.type === "CLEAR_LOG_BUFFER") {
+    logBuffer.splice(0, logBuffer.length);
   }
 });
 
@@ -128,7 +124,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   unmarkTabActivated(tabId).catch((error) => {
-    console.warn(`[Vorder] Failed to clear tab activation for ${tabId}: ${error.message}`);
   });
 });
 
@@ -209,7 +204,6 @@ async function runAutomationLoop(userRequest) {
         break;
       }
 
-      console.log("[Vorder] PLAN:", JSON.stringify(plan, null, 2));
       notifyPip("APPEND_LOG", `[계획] ${plan.description}`, tabId);
 
       if (plan.isComplete) {
@@ -238,6 +232,9 @@ async function runAutomationLoop(userRequest) {
         }
 
         await removeOverlay(tabId);
+        if (isLogin) {
+          await waitForIframeDomSettle(tabId);
+        }
         notifyPip("APPEND_LOG", "[안내] 입력 완료. 재개합니다.", tabId);
         notifyPip("UPDATE_STATUS", "", tabId);
 
@@ -476,6 +473,23 @@ async function waitForNavigationOrDismiss(tabId) {
   });
 }
 
+async function waitForIframeDomSettle(tabId, timeout = 1200) {
+  const debuggee = { tabId };
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeout) {
+    try {
+      const frameTreeResult = await cdpCommand(debuggee, "Page.getFrameTree");
+      if (collectChildFrames(frameTreeResult.frameTree).length > 0) {
+        await sleep(300);
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+    await sleep(150);
+  }
+}
+
 async function waitForOverlayComplete(tabId) {
   return new Promise((resolve) => {
     const listener = (msg, sender) => {
@@ -553,11 +567,33 @@ async function collectPageStateViaCdp(tabId, attachedIframeTargetIds = new Set()
     });
   }
 
-  const iframeElements = await collectCrossOriginIframeElements(
+  let iframeElements = await collectCrossOriginIframeElements(
     tabId, frameTreeResult, iframeNodeMap, attachedIframeTargetIds, contentDocFrameIds
   );
 
-  const allElements = iframeElements.length > 0 ? iframeElements : interactiveElements;
+  const childFrames = collectChildFrames(frameTreeResult.frameTree);
+  const contentDocumentFrameElements = interactiveElements.filter((el) => el.frameId !== "main");
+  if (childFrames.length > 0 && iframeElements.length === 0 && contentDocumentFrameElements.length === 0) {
+    console.warn("[Vorder][iframe-diag] child frame exists but no iframe DOM collected; retrying once");
+    await sleep(300);
+    iframeElements = await collectCrossOriginIframeElements(
+      tabId, frameTreeResult, iframeNodeMap, attachedIframeTargetIds, contentDocFrameIds
+    );
+  }
+
+  const iframeScopedElements = iframeElements.length > 0
+    ? iframeElements
+    : contentDocumentFrameElements;
+  const iframeOnlyMode = iframeScopedElements.length > 0;
+  const allElements = iframeOnlyMode
+    ? iframeScopedElements
+    : interactiveElements;
+  console.log("[Vorder][iframe-diag] selected DOM scope:", {
+    childFrames: childFrames.length,
+    isolatedIframeElements: iframeElements.length,
+    contentDocumentFrameElements: contentDocumentFrameElements.length,
+    mode: iframeOnlyMode ? "iframe" : "main",
+  });
   const sortedElements = prioritizeInteractiveElements(allElements);
   const frames = frameMap.frames;
   const title = await getDocumentTitle(debuggee);
@@ -602,8 +638,9 @@ function walkDomTree(node, currentFrameCdpId, out, iframeNodeMap, contentDocFram
   }
 
   if (node.contentDocument) {
-    const nextFrameCdpId = node.contentDocument.frameId || currentFrameCdpId;
-    if (nextFrameCdpId && contentDocFrameIds) contentDocFrameIds.add(nextFrameCdpId);
+    const nextFrameCdpId = node.contentDocument.frameId || node.frameId || currentFrameCdpId;
+    const frameIdForTracking = node.contentDocument.frameId || node.frameId;
+    if (frameIdForTracking && contentDocFrameIds) contentDocFrameIds.add(frameIdForTracking);
     walkDomTree(node.contentDocument, nextFrameCdpId, out, iframeNodeMap, contentDocFrameIds);
   } else if (tag === "iframe" && node.frameId) {
     iframeNodeMap?.set(node.frameId, node.nodeId);
@@ -629,7 +666,6 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
   // Fill missing iframeNodeMap entries via DOM.getFrameOwner for cross-origin frames
   for (const childFrame of allFrames) {
     const frameId = childFrame.frame.id;
-    if (contentDocFrameIds.has(frameId)) continue;
     if (iframeNodeMap.has(frameId)) continue;
     try {
       const ownerResult = await cdpCommand(mainDebuggee, "DOM.getFrameOwner", { frameId });
@@ -650,11 +686,6 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
   for (const childFrame of allFrames) {
     const frameId = childFrame.frame.id;
 
-    if (contentDocFrameIds.has(frameId)) {
-      console.log("[Vorder][iframe-diag] skip (already collected via contentDocument):", frameId);
-      continue;
-    }
-
     if (!iframeNodeMap.has(frameId)) {
       console.log("[Vorder][iframe-diag] skip (no host nodeId):", frameId);
       continue;
@@ -663,6 +694,10 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
     const hostNodeId = iframeNodeMap.get(frameId);
     const hostBox = await getBoxModelSafe(mainDebuggee, hostNodeId);
     if (!hostBox) continue;
+    if (!isBoxInViewport(hostBox, viewport)) {
+      console.log("[Vorder][iframe-diag] skip (iframe host outside viewport):", frameId);
+      continue;
+    }
     const hostOffsetX = Math.min(...hostBox.border.filter((_, i) => i % 2 === 0));
     const hostOffsetY = Math.min(...hostBox.border.filter((_, i) => i % 2 === 1));
 
@@ -704,6 +739,16 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
     const inputName = normalize(el.getAttribute("name"), 80);
     const title = normalize(el.getAttribute("title"), 80);
     const visibleText = normalize(el.innerText || el.textContent || "", 80);
+    const describedByText = (() => {
+      const ids = normalize(el.getAttribute("aria-describedby"), 200);
+      if (!ids) return null;
+      const texts = ids.split(/\\s+/)
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(node => normalize(node.innerText || node.textContent, 80))
+        .filter(Boolean);
+      return texts.length ? texts.join(" ") : ids;
+    })();
     const getLabelText = () => {
       if (el.labels && el.labels.length) {
         return normalize(Array.from(el.labels).map(l => l.innerText).join(" "), 80);
@@ -723,7 +768,7 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
     };
     const labelText = getLabelText();
     const nearbyText = getNearbyText();
-    const semanticName = ariaLabel || labelText || visibleText || placeholder || inputName || title || nearbyText || (tag + "#" + idx);
+    const semanticName = ariaLabel || labelText || visibleText || title || describedByText || nearbyText || placeholder || inputName || (tag + "#" + idx);
     let value = null;
     if ("value" in el && typeof el.value === "string" && el.value) {
       value = el.type === "password" ? "[MASKED]" : el.value.slice(0, 200);
@@ -735,7 +780,7 @@ async function collectCrossOriginIframeElements(tabId, frameTreeResult, iframeNo
     const inViewport = rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
     elements.push({
       tag, type: el.getAttribute("type") || null, role: el.getAttribute("role") || null,
-      name: semanticName, text: normalize(el.innerText || el.value || ariaLabel || "", 200) || "",
+      name: semanticName, text: normalize(el.innerText || el.value || ariaLabel || labelText || title || describedByText || placeholder || "", 200) || "",
       ariaLabel, nearbyText, placeholder: el.type === "password" ? "[비밀번호]" : placeholder,
       value, checked: "checked" in el ? Boolean(el.checked) : null,
       required: Boolean(el.required), enabled: !el.disabled, inputName, options, inViewport,
@@ -1028,23 +1073,28 @@ async function showClickIndicator(debuggee, x, y) {
 
 async function cdpClickByNodeId(tabId, action, elements) {
   const resolved = await resolveByNodeIdOrName(tabId, action, elements);
-  const { debuggee, cdpNodeId } = resolved;
+  const { debuggee, cdpNodeId, element } = resolved;
   const inputDebuggee = { tabId };
+  const hasRealNodeId = element.__cdpNodeId !== null;
 
-  const state = await getElementState(debuggee, cdpNodeId);
-  if (!state.found) throw new DomStaleError("not_found", action.name || action.nodeId);
-  if (!state.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
+  if (hasRealNodeId) {
+    const state = await getElementState(debuggee, cdpNodeId);
+    if (!state.found) throw new DomStaleError("not_found", action.name || action.nodeId);
+    if (!state.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
+  }
 
   let box = resolved.box;
   const viewport = await getViewportSize(inputDebuggee);
   let point = getBoxCenter(box);
 
   if (!isPointInViewport(point, viewport)) {
-    await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
-    box = resolved.element.precomputedRect
-      ? resolved.box
-      : await requireBoxModel(debuggee, cdpNodeId, action.name);
-    point = getBoxCenter(box);
+    if (hasRealNodeId) {
+      await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
+      box = element.precomputedRect
+        ? resolved.box
+        : await requireBoxModel(debuggee, cdpNodeId, action.name);
+      point = getBoxCenter(box);
+    }
   }
 
   await showClickIndicator(inputDebuggee, point.x, point.y);
@@ -1079,23 +1129,47 @@ async function cdpTypeByNodeId(tabId, action, elements) {
   if (action.value == null) throw new Error("type: value 필요");
 
   const resolved = await resolveByNodeIdOrName(tabId, action, elements);
-  const { debuggee, cdpNodeId } = resolved;
+  const { debuggee, cdpNodeId, element } = resolved;
   const inputDebuggee = { tabId };
+  const hasRealNodeId = element.__cdpNodeId !== null;
 
-  await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
-  const editable = await getElementState(debuggee, cdpNodeId);
-  if (!editable.found) throw new DomStaleError("not_found", action.name || action.nodeId);
-  if (!editable.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
-  if (!editable.editable) throw new DomStaleError("not_editable", action.name || action.nodeId);
+  if (hasRealNodeId) {
+    await cdpCommand(debuggee, "DOM.scrollIntoViewIfNeeded", { nodeId: cdpNodeId });
+    const editable = await getElementState(debuggee, cdpNodeId);
+    if (!editable.found) throw new DomStaleError("not_found", action.name || action.nodeId);
+    if (!editable.enabled) throw new DomStaleError("disabled", action.name || action.nodeId);
+    if (!editable.editable) throw new DomStaleError("not_editable", action.name || action.nodeId);
+  }
 
   const typePoint = getBoxCenter(resolved.box);
   await showClickIndicator(inputDebuggee, typePoint.x, typePoint.y);
   await sleep(100);
 
-  await cdpCommand(debuggee, "DOM.focus", { nodeId: cdpNodeId });
-  await clearFocusedValue(debuggee, cdpNodeId, inputDebuggee);
+  if (hasRealNodeId) {
+    await cdpCommand(debuggee, "DOM.focus", { nodeId: cdpNodeId });
+    await clearFocusedValue(debuggee, cdpNodeId, inputDebuggee);
+  } else {
+    await cdpCommand(inputDebuggee, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: typePoint.x,
+      y: typePoint.y,
+      button: "left",
+      clickCount: 1,
+    });
+    await cdpCommand(inputDebuggee, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: typePoint.x,
+      y: typePoint.y,
+      button: "left",
+      clickCount: 1,
+    });
+  }
+
   await cdpCommand(inputDebuggee, "Input.insertText", { text: String(action.value) });
-  await dispatchInputEvents(debuggee, cdpNodeId);
+
+  if (hasRealNodeId) {
+    await dispatchInputEvents(debuggee, cdpNodeId);
+  }
 
   return { result: resolved.usedFallback ? "success_fallback" : "success" };
 }
@@ -1168,7 +1242,6 @@ async function resolveByNodeIdOrName(tabId, action, elements) {
     ? boxFromPrecomputedRect(fallback.precomputedRect)
     : await requireBoxModel(debuggee, cdpNodeId, action.name);
   const message = `[FALLBACK] nodeId ${action.nodeId} → name "${action.name}" 로 매칭`;
-  console.warn(message);
   notifyPip("APPEND_LOG", message, tabId);
   return { element: fallback, box, debuggee, cdpNodeId, usedFallback: true };
 }
@@ -1273,7 +1346,6 @@ async function waitForPageLoad(tabId, timeout = PAGE_LOAD_TIMEOUT_MS) {
       // 페이지 전환 중 일시적 오류 → 다시 시도
     }
   }
-  console.warn("[Vorder] waitForPageLoad timeout");
 }
 
 function buildFrameMap(frameTree) {
@@ -1542,7 +1614,6 @@ function sleep(ms) {
 }
 
 async function cdpCommand(debuggee, method, params) {
-  console.log("[CDP]", method, JSON.stringify(params ?? {}));
   return chrome.debugger.sendCommand(debuggee, method, params);
 }
 
