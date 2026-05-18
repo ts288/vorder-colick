@@ -23,6 +23,8 @@ openai_client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_k
 
 CLICKABLE_TAGS = {"button", "a"}
 CLICKABLE_INPUT_TYPES = {"submit", "button", "checkbox", "radio"}
+TARGET_REQUIRED_ACTIONS = {"click", "type", "select"}
+TARGETLESS_ACTIONS = {"scroll", "wait"}
 
 
 def _is_clickable(el: InteractiveElement) -> bool:
@@ -102,11 +104,9 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
 
     el_map = {el.node_id: el for el in request.page_state.interactive_elements}
     valid_node_ids = set(el_map)
-    requires_target = {"click", "type", "select"}
-
     valid_actions = []
     for action in plan.actions:
-        if action.type in requires_target:
+        if action.type in TARGET_REQUIRED_ACTIONS:
             if action.node_id is None or not action.name:
                 continue
             if action.node_id not in valid_node_ids:
@@ -118,7 +118,12 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
             valid_actions.append(action)
             continue
 
-        if action.node_id is None or action.node_id in valid_node_ids:
+        if action.type in TARGETLESS_ACTIONS:
+            if action.node_id is None or action.node_id in valid_node_ids:
+                valid_actions.append(action)
+            continue
+
+        if action.node_id is not None and action.node_id in valid_node_ids:
             valid_actions.append(action)
 
     valid_overlay_targets = []
@@ -135,7 +140,7 @@ async def get_plan(request: PlanRequest, process_state: ProcessState) -> PlanRes
         and plan.plan_type not in ("completed", "error")
     ):
         plan.plan_type = "error"
-        plan.description = "유효한 액션이 없습니다. DOM을 다시 수집하거나 요청을 확인해주세요."
+        plan.description = "현재 페이지에서 요청한 정보를 찾을 수 없습니다. 다른 페이지에서 다시 시도해주세요."
 
     print(f"[Vorder] PLAN_TYPE: {plan.plan_type} | {plan.description}")
     for i, action in enumerate(plan.actions):
