@@ -175,6 +175,7 @@ async function runAutomationLoop(userRequest) {
         pageState = await collectPageStateViaCdp(tabId, attachedIframeTargetIds);
       } catch (e) {
         notifyPip("APPEND_LOG", "[오류] DOM 수집 실패: " + e.message, tabId);
+        notifyPip("APPEND_LOG", "[안내] 현재 페이지에서 요청한 정보를 찾을 수 없습니다. 다른 페이지에서 다시 시도해주세요.", tabId);
         break;
       }
 
@@ -250,7 +251,8 @@ async function runAutomationLoop(userRequest) {
         continue;
       }
       if (plan.planType === "error") {
-        notifyPip("APPEND_LOG", "[오류] LLM 오류 응답", tabId);
+        notifyPip("APPEND_LOG", `[안내] ${plan.description || "현재 페이지에서 요청한 정보를 찾을 수 없습니다. 다른 페이지에서 다시 시도해주세요."}`, tabId);
+        notifyPip("UPDATE_STATUS", "", tabId);
         break;
       }
 
@@ -584,15 +586,12 @@ async function collectPageStateViaCdp(tabId, attachedIframeTargetIds = new Set()
   const iframeScopedElements = iframeElements.length > 0
     ? iframeElements
     : contentDocumentFrameElements;
-  const iframeOnlyMode = iframeScopedElements.length > 0;
-  const allElements = iframeOnlyMode
-    ? iframeScopedElements
-    : interactiveElements;
+  const allElements = mergeInteractiveElements(interactiveElements, iframeScopedElements);
   console.log("[Vorder][iframe-diag] selected DOM scope:", {
     childFrames: childFrames.length,
     isolatedIframeElements: iframeElements.length,
     contentDocumentFrameElements: contentDocumentFrameElements.length,
-    mode: iframeOnlyMode ? "iframe" : "main",
+    mode: iframeScopedElements.length > 0 ? "mixed" : "main",
   });
   const sortedElements = prioritizeInteractiveElements(allElements);
   const frames = frameMap.frames;
@@ -1381,6 +1380,16 @@ function prioritizeInteractiveElements(elements) {
   const inViewport = elements.filter((element) => element.__inViewport);
   const outOfViewport = elements.filter((element) => !element.__inViewport);
   return [...inViewport, ...outOfViewport].slice(0, 500).map(stripInternalFields);
+}
+
+function mergeInteractiveElements(mainElements, iframeElements) {
+  if (!iframeElements.length) {
+    return mainElements;
+  }
+
+  const iframeNodeIds = new Set(iframeElements.map((element) => element.nodeId));
+  const mainOnlyElements = mainElements.filter((element) => !iframeNodeIds.has(element.nodeId));
+  return [...mainOnlyElements, ...iframeElements];
 }
 
 function stripInternalFields(element) {
