@@ -8,6 +8,7 @@ const SERVER_URL = "http://localhost:8000";
 const MAX_STEPS = 20;
 const MAX_CONSECUTIVE_DOM_STALE = 3;
 const MAX_CONSECUTIVE_REPEAT = 2;
+const MAX_CONSECUTIVE_RECOVERY = 2;
 const ACTION_DELAY_MS = 300;
 const PAGE_LOAD_TIMEOUT_MS = 10000;
 const DOM_CHANGE_ACTION_TYPES = new Set(["click", "type", "select"]);
@@ -161,6 +162,7 @@ async function runAutomationLoop(userRequest) {
     let step = 0;
     let allPreviousActions = [];
     let consecutiveDomStale = 0;
+    let consecutiveRecovery = 0;
     let lastActionKey = null;
     let lastActionRepeatCount = 0;
 
@@ -203,6 +205,18 @@ async function runAutomationLoop(userRequest) {
       } catch (e) {
         notifyPip("APPEND_LOG", "[오류] 서버 연결 실패: " + e.message, tabId);
         break;
+      }
+
+      if (plan.recoveryMode) {
+        consecutiveRecovery++;
+        notifyPip("APPEND_LOG", `[RecoveryMode] ${plan.recoveryReason || "현재 페이지를 다시 분석했습니다."}`, tabId);
+        if (consecutiveRecovery >= MAX_CONSECUTIVE_RECOVERY) {
+          notifyPip("APPEND_LOG", "[안내] 현재 화면에서 다음 동작을 확실하게 판단하지 못해 자동 수행을 멈췄어요. 화면을 확인한 뒤 다시 시도해 주세요.", tabId);
+          notifyPip("UPDATE_STATUS", "", tabId);
+          break;
+        }
+      } else {
+        consecutiveRecovery = 0;
       }
 
       notifyPip("APPEND_LOG", `[계획] ${plan.description}`, tabId);
@@ -251,6 +265,11 @@ async function runAutomationLoop(userRequest) {
         continue;
       }
       if (plan.planType === "error") {
+        if (plan.recoveryMode && consecutiveRecovery < MAX_CONSECUTIVE_RECOVERY) {
+          notifyPip("APPEND_LOG", "[RecoveryMode] 재수집 후 한 번 더 재판단합니다.", tabId);
+          step++;
+          continue;
+        }
         notifyPip("APPEND_LOG", `[안내] ${plan.description || "현재 페이지에서 요청한 정보를 찾을 수 없습니다. 다른 페이지에서 다시 시도해주세요."}`, tabId);
         notifyPip("UPDATE_STATUS", "", tabId);
         break;

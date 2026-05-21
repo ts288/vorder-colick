@@ -116,3 +116,5 @@ class PlanResponse(_Base):
     is_complete: bool
     next_hint: NextHint | None = None
     intent: Intent | None = None
+    recovery_mode: bool = False
+    recovery_reason: str | None = None

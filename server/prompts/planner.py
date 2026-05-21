@@ -39,6 +39,11 @@ SYSTEM_PROMPT = """당신은 웹사이트에서 사용자의 업무를 자동화
 - `completed`: 목표 달성 시. is_complete를 true로 설정.
 - `error`: 진행 불가능할 때.
 
+### recovery_mode / recovery_reason
+- 일반 판단에서는 recovery_mode=false로 반환하세요.
+- 입력에 "Recovery Mode" 섹션이 있으면 recovery_mode=true로 반환하고, recovery_reason에는 예측이 어긋난 이유를 자연어 문장으로 짧게 작성하세요.
+- Recovery Mode에서는 현재 페이지를 다시 분석해서 다음 행동을 재조정합니다. description에는 현재 상태와 다음 조치를 사용자가 이해할 수 있게 적으세요.
+
 ### actions (plan_type이 auto_execute일 때)
 한 번에 1~3개의 액션을 반환하세요. 각 액션 타입:
 - `click`: 요소 클릭. `node_id`(int)와 `name`(str) 필수.
@@ -110,6 +115,9 @@ DOM이 크게 바뀔 액션(페이지 이동, 폼 제출 등)은 `navigates: tru
 - 이미 성공한 동작과 같은 의미의 동작을 반복하지 마세요.
   예: "여권 재발급 신청" 클릭이 이미 성공했으면, 현재 페이지는 그 결과입니다. 같은 텍스트의 요소를 또 클릭하지 말고 "신청하기" 같은 다음 단계 요소를 찾으세요.
 - 현재 페이지에서 목표에 더 가까워지는 **새로운** 동작을 선택하세요.
+- 어떤 단계가 완료되었거나 완료된 상태일 가능성이 높다고 판단했다면, 그 단계를 다시 요구하지 말고 다음 단계를 시도하세요.
+- reasoning이나 description에서 "완료됨", "완료된 상태", "가능성이 높음"이라고 판단한 단계와 같은 단계를 다시 수행하라고 안내하면 안 됩니다.
+- 상태 판단과 다음 행동은 서로 모순되면 안 됩니다. 예를 들어 어떤 선행 단계가 완료된 상태라고 판단했다면, description에서 그 선행 단계를 다시 진행하라고 쓰지 말고 현재 DOM에서 이어서 할 수 있는 다음 CTA, 입력, 선택, 확인 동작을 찾으세요.
 
 ### 요소 선택 우선순위
 1. **팝업/모달이 떠 있으면 모달 내부 요소를 최우선 처리합니다.**
@@ -198,6 +206,8 @@ def build_user_message(
     request: "PlanRequest",
     filtered_elements: list,
     intent: "Intent | None" = None,
+    recovery_mode: bool = False,
+    recovery_reason: str | None = None,
 ) -> str:
     import json
 
@@ -236,9 +246,33 @@ def build_user_message(
 없으면 "{intent.subject}" 관련 요소를 탐색하고, 이후에는 "{intent.verb}"를 최우선으로 행동하세요.
 """
 
+    recovery_section = ""
+    element_label = "정제됨"
+    if recovery_mode:
+        element_label = "Recovery Mode: 예측 기반 필터링 없이 재분석"
+        recovery_section = f"""
+## Recovery Mode
+이전 예측 또는 정제된 DOM만으로는 안정적인 다음 행동을 결정할 수 없었습니다.
+현재 페이지를 전체 목표와 이전 액션 이력 기준으로 다시 분석하세요.
+이전 next_hint나 예측 action을 정답으로 간주하지 마세요. 실패 원인을 파악하기 위한 참고 정보로만 사용하세요.
+직전 action 또는 최근 성공 action이 의도한 상태 변화가 실제로 발생했다고 가정하지 말고, 현재 페이지의 URL, 제목, 알림, current_step, 그리고 서버가 전달한 수집 DOM 전체(interactive_elements)를 근거로 기대 상태가 달성되었는지 판단하세요.
+다음 action은 현재 interactive_elements에 실제 존재하는 요소만 기준으로 선택하세요.
+
+반드시 다음을 판단하세요:
+- 현재 페이지가 어떤 상태인지
+- 이전 예측이 왜 어긋났는지
+- 이후에 어떤 동작을 해야 하는지
+
+Recovery Mode에서도 수집 DOM 전체(interactive_elements) 안에 근거 있는 action이 없으면 추측하지 말고 plan_type="error"를 반환하세요. 이 경우 description에는 사용자가 PIP에서 이해할 수 있는 중단 사유를 적으세요.
+
+recovery_mode=true로 반환하고 recovery_reason에는 직전 action의 기대 상태, 수집 DOM 전체에서 확인한 실제 상태, 둘 사이의 차이를 자연어로 요약하세요.
+서버 판단 사유: {recovery_reason or "정제된 DOM에서 실행 가능한 액션을 찾지 못함"}
+"""
+
     return f"""## 전체 목표
 {request.user_request}
 {intent_section}
+{recovery_section}
 
 ## 현재 페이지
 URL: {request.page_state.url}
@@ -249,7 +283,7 @@ URL: {request.page_state.url}
 ## 이전 액션 이력 (step {request.step})
 {json.dumps(request.previous_actions, ensure_ascii=False)}
 {failed_warning}
-## 현재 페이지 인터랙티브 요소 (정제됨)
+## 현재 페이지 인터랙티브 요소 ({element_label})
 {elements_json}
 """
 
