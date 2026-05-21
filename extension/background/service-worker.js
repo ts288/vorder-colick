@@ -565,6 +565,8 @@ async function collectPageStateViaCdp(tabId, attachedIframeTargetIds = new Set()
       required: meta.required,
       options: meta.options,
       enabled: meta.enabled,
+      __insidePopup: Boolean(meta.insidePopup),
+      __popupInfo: meta.popupInfo || null,
       __inViewport: meta.inViewport || isBoxInViewport(box, viewport),
     });
   }
@@ -586,14 +588,22 @@ async function collectPageStateViaCdp(tabId, attachedIframeTargetIds = new Set()
   const iframeScopedElements = iframeElements.length > 0
     ? iframeElements
     : contentDocumentFrameElements;
-  const allElements = mergeInteractiveElements(interactiveElements, iframeScopedElements);
-  console.log("[Vorder][iframe-diag] selected DOM scope:", {
+  const popupScopedElements = interactiveElements.filter((element) => element.__insidePopup);
+  const mainElements = interactiveElements.filter((element) => element.frameId === "main");
+  const selectedScope = selectDomScope(popupScopedElements, iframeScopedElements, mainElements);
+  if (selectedScope.scope === "popup") {
+    const popupInfo = popupScopedElements.find((element) => element.__popupInfo)?.__popupInfo;
+    console.log("[Vorder][popup] active popup detected:", popupInfo || {});
+  }
+  console.log("[Vorder][iframe-diag] collected DOM scopes:", {
     childFrames: childFrames.length,
+    mainElements: mainElements.length,
+    popupElements: popupScopedElements.length,
     isolatedIframeElements: iframeElements.length,
     contentDocumentFrameElements: contentDocumentFrameElements.length,
-    mode: iframeScopedElements.length > 0 ? "mixed" : "main",
   });
-  const sortedElements = prioritizeInteractiveElements(allElements);
+  console.log("[Vorder][dom-scope] selected:", selectedScope.scope, "elements=", selectedScope.elements.length, "reason=", selectedScope.reason);
+  const sortedElements = prioritizeInteractiveElements(selectedScope.elements);
   const frames = frameMap.frames;
   const title = await getDocumentTitle(debuggee);
   const url = (await chrome.tabs.get(tabId)).url || "";
@@ -913,6 +923,108 @@ async function getNodeMetadata(debuggee, nodeId, tag, fallbackIndex) {
         };
         const clip = (value, max) => normalize(value, max);
         const tagName = (el.tagName || "").toLowerCase();
+        const getZIndex = (node) => {
+          const parsed = Number.parseInt(getComputedStyle(node).zIndex, 10);
+          return Number.isFinite(parsed) ? parsed : 0;
+        };
+        const isVisibleBox = (node) => {
+          const style = getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return (
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            Number(style.opacity || "1") > 0 &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.bottom > 0 &&
+            rect.right > 0 &&
+            rect.top < window.innerHeight &&
+            rect.left < window.innerWidth
+          );
+        };
+        const hasPopupName = (node) => {
+          const className =
+            typeof node.className === "string" ? node.className : node.getAttribute("class") || "";
+          const haystack = ((node.id || "") + " " + className).toLowerCase();
+          return /(modal|popup|pop-content|pop-|pop_|layer|dialog)/.test(haystack);
+        };
+        const isTopLayerCandidate = (node) => {
+          const rect = node.getBoundingClientRect();
+          const points = [
+            [rect.left + rect.width / 2, rect.top + rect.height / 2],
+            [rect.left + Math.min(20, rect.width / 2), rect.top + Math.min(20, rect.height / 2)],
+          ];
+          return points.some(([x, y]) => {
+            if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return false;
+            const topEl = document.elementFromPoint(x, y);
+            return topEl && (node === topEl || node.contains(topEl) || topEl.contains(node));
+          });
+        };
+        const scorePopupCandidate = (node) => {
+          if (!node || !node.matches || node.id === "vorder-pip-host" || node.id === "vorder-overlay-host") {
+            return null;
+          }
+          if (!isVisibleBox(node)) return null;
+          const style = getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          const role = node.getAttribute("role");
+          const semantic =
+            node.matches("dialog[open]") ||
+            role === "dialog" ||
+            role === "alertdialog" ||
+            node.getAttribute("aria-modal") === "true";
+          const named = hasPopupName(node);
+          const floating = ["fixed", "absolute", "sticky"].includes(style.position);
+          if (!semantic && !named && !floating) return null;
+
+          let score = 0;
+          if (node.matches("dialog[open]")) score += 10;
+          if (role === "dialog" || role === "alertdialog") score += 8;
+          if (node.getAttribute("aria-modal") === "true") score += 8;
+          if (named) score += 4;
+          score += 3;
+          if (floating) score += 3;
+          const zIndex = getZIndex(node);
+          if (zIndex >= 100) score += 2;
+          if (isTopLayerCandidate(node)) score += 4;
+          if (rect.width >= window.innerWidth * 0.2 && rect.height >= window.innerHeight * 0.1) score += 2;
+          if (!semantic && !named && score < 8) return null;
+          return {
+            node,
+            score,
+            zIndex,
+            text: normalize(node.innerText || node.textContent || "", 120),
+            className: typeof node.className === "string" ? node.className : node.getAttribute("class") || "",
+            id: node.id || "",
+          };
+        };
+        const findActivePopup = () => {
+          const selectors = [
+            "dialog[open]",
+            "[role='dialog']",
+            "[role='alertdialog']",
+            "[aria-modal='true']",
+            "[class*='modal' i]",
+            "[class*='popup' i]",
+            "[class*='pop-content' i]",
+            "[class*='pop-' i]",
+            "[class*='pop_' i]",
+            "[class*='layer' i]",
+            "[class*='dialog' i]",
+            "[id*='modal' i]",
+            "[id*='popup' i]",
+            "[id*='layer' i]",
+          ].join(",");
+          const scored = Array.from(document.querySelectorAll(selectors))
+            .map(scorePopupCandidate)
+            .filter(Boolean)
+            .filter((candidate) => candidate.score >= 8);
+          scored.sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return b.zIndex - a.zIndex;
+          });
+          return scored[0] || null;
+        };
 
         const getLabelText = () => {
           if (el.labels && el.labels.length) {
@@ -982,6 +1094,8 @@ async function getNodeMetadata(debuggee, nodeId, tag, fallbackIndex) {
             text: clip(opt.text, 200) || "",
           }));
         }
+        const activePopup = findActivePopup();
+        const insidePopup = Boolean(activePopup && activePopup.node.contains(el));
 
         return {
           name: semanticName,
@@ -994,6 +1108,14 @@ async function getNodeMetadata(debuggee, nodeId, tag, fallbackIndex) {
           enabled: !el.disabled,
           inputName,
           options,
+          insidePopup,
+          popupInfo: insidePopup ? {
+            score: activePopup.score,
+            zIndex: activePopup.zIndex,
+            id: activePopup.id,
+            className: activePopup.className,
+            text: activePopup.text,
+          } : null,
           inViewport,
         };
       }`,
@@ -1382,18 +1504,30 @@ function prioritizeInteractiveElements(elements) {
   return [...inViewport, ...outOfViewport].slice(0, 500).map(stripInternalFields);
 }
 
-function mergeInteractiveElements(mainElements, iframeElements) {
-  if (!iframeElements.length) {
-    return mainElements;
+function selectDomScope(popupElements, iframeElements, mainElements) {
+  if (popupElements.length > 0) {
+    return {
+      scope: "popup",
+      elements: popupElements,
+      reason: "active popup detected",
+    };
   }
-
-  const iframeNodeIds = new Set(iframeElements.map((element) => element.nodeId));
-  const mainOnlyElements = mainElements.filter((element) => !iframeNodeIds.has(element.nodeId));
-  return [...mainOnlyElements, ...iframeElements];
+  if (iframeElements.length > 0) {
+    return {
+      scope: "iframe",
+      elements: iframeElements,
+      reason: "iframe elements detected",
+    };
+  }
+  return {
+    scope: "main",
+    elements: mainElements,
+    reason: "no popup or iframe",
+  };
 }
 
 function stripInternalFields(element) {
-  const { __inViewport, ...rest } = element;
+  const { __inViewport, __insidePopup, __popupInfo, ...rest } = element;
   return rest;
 }
 
